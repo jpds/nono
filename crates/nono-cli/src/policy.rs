@@ -5065,6 +5065,30 @@ mod tests {
     }
 
     #[test]
+    fn test_nix_profile_state_write_group_includes_profile_state_path() {
+        let json = crate::config::embedded::embedded_policy_json();
+        let policy = load_policy(json).expect("parse policy.json");
+        let group = policy
+            .groups
+            .get("nix_profile_state_write")
+            .expect("nix_profile_state_write group must exist");
+        let allow = group
+            .allow
+            .as_ref()
+            .expect("nix_profile_state_write must have allow block");
+        let write_paths = &allow.write;
+        assert!(
+            write_paths.contains(&"~/.local/state/nix/profiles".to_string()),
+            "nix_profile_state_write must grant write on ~/.local/state/nix/profiles \
+             for Nix profile mutation"
+        );
+        assert!(
+            allow.read.is_empty(),
+            "nix_profile_state_write is write-only: read access stays in nix_runtime"
+        );
+    }
+
+    #[test]
     fn test_snap_linux_group_includes_snap_mount_paths() {
         let json = crate::config::embedded::embedded_policy_json();
         let policy = load_policy(json).expect("parse policy.json");

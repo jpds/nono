@@ -574,6 +574,14 @@
         ]
       }
     },
+    "nix_profile_state_write": {
+      "description": "Nix profile mutation - write access to the user profiles state directory",
+      "allow": {
+        "write": [
+          "~/.local/state/nix/profiles"
+        ]
+      }
+    },
     "git_config": {
       "description": "Read access to git configuration files",
       "allow": {
