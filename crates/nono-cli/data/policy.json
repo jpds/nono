@@ -566,6 +566,7 @@
           "~/.local/state/nix/profiles",
           "~/.nix-defexpr",
           "~/.local/state/nix/defexpr",
+          "~/.local/share/nix",
           "/run/current-system/sw",
           "/etc/profiles/per-user",
           "/nix/var/nix/profiles",

@@ -5042,7 +5042,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nix_runtime_group_includes_nix_store() {
+    fn test_nix_runtime_group_includes_expected_paths() {
         let json = crate::config::embedded::embedded_policy_json();
         let policy = load_policy(json).expect("parse policy.json");
         let group = policy
@@ -5057,6 +5057,10 @@ mod tests {
         assert!(
             read_paths.contains(&"/nix/store".to_string()),
             "nix_runtime group must include /nix/store for NixOS compatibility"
+        );
+        assert!(
+            read_paths.contains(&"~/.local/share/nix".to_string()),
+            "nix_runtime group must include ~/.local/share/nix (trusted-settings.json, chroot-store roots)"
         );
     }
 
