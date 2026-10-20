@@ -1251,8 +1251,8 @@ where
 
     // --- Read body (Content-Length only; chunked is rare in API requests
     // and matches the existing reverse-proxy contract). ---
-    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let mut filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
+    let mut filtered_headers =
+        reverse::filter_headers_multi(&req.header_bytes, reverse::credential_strip_headers(cred));
     if is_oauth_capture_host {
         filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
         filtered_headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
@@ -2630,6 +2630,7 @@ mod tests {
     ) -> crate::config::RouteConfig {
         crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: prefix.to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: Some(format!("env://{}_TOKEN", prefix.to_uppercase())),
@@ -2667,6 +2668,7 @@ mod tests {
         fn cred_route(prefix: &str, path: &str) -> crate::config::RouteConfig {
             crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: prefix.to_string(),
                 upstream: "https://example.com".to_string(),
                 credential_key: Some(format!("env://{}_TOKEN", prefix.to_uppercase())),
@@ -2756,6 +2758,7 @@ mod tests {
         fn route(prefix: &str, path: &str, redeem: &[&str]) -> crate::config::RouteConfig {
             crate::config::RouteConfig {
                 redeem_phantoms: redeem.iter().map(|s| (*s).to_string()).collect(),
+                inject_headers: None,
                 prefix: prefix.to_string(),
                 upstream: "https://example.com".to_string(),
                 credential_key: None,
@@ -2846,6 +2849,7 @@ mod tests {
                 max_delay_secs: 0,
             }),
             redeem_phantoms: vec![],
+            inject_headers: None,
         };
 
         let store = RouteStore::load(&[route]).await.unwrap();
@@ -2913,6 +2917,7 @@ mod tests {
     fn approval_gated_route(prefix: &str) -> crate::config::RouteConfig {
         crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: prefix.to_string(),
             upstream: "https://example.com".to_string(),
             credential_key: Some(format!("env://{}_TOKEN", prefix.to_uppercase())),

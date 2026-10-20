@@ -13,6 +13,7 @@ use nono_proxy::spiffe::SpiffeJwtSource;
 fn make_jwt_route(socket: &str) -> RouteConfig {
     RouteConfig {
         redeem_phantoms: Vec::new(),
+        inject_headers: None,
         prefix: "testapi".to_string(),
         upstream: "http://127.0.0.1:1".to_string(),
         credential_key: None,
@@ -153,6 +154,7 @@ async fn test_spiffe_jwt_live_proxy_startup() {
 
     let route = RouteConfig {
         redeem_phantoms: Vec::new(),
+        inject_headers: None,
         prefix: "testapi".to_string(),
         upstream: "http://127.0.0.1:1".to_string(),
         credential_key: None,
