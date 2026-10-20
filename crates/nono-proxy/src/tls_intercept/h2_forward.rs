@@ -462,14 +462,8 @@ async fn handle_h2_stream(
     if let Some(cred) = cred
         && matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
     {
-        if !cred.header_value.is_empty()
-            && let Ok(val) = HeaderValue::from_str(cred.header_value.as_str())
-            && let Ok(name) = http::header::HeaderName::from_bytes(cred.header_name.as_bytes())
-        {
-            upstream_headers.insert(name, val);
-        }
-        for (header_name, header_value) in &cred.extra_headers {
-            if let Ok(val) = HeaderValue::from_str(header_value.as_str())
+        for (header_name, header_value) in crate::reverse::injected_credential_pairs(cred) {
+            if let Ok(val) = HeaderValue::from_str(header_value)
                 && let Ok(name) = http::header::HeaderName::from_bytes(header_name.as_bytes())
             {
                 upstream_headers.insert(name, val);
@@ -810,6 +804,7 @@ mod tests {
     ) -> (RouteStore, CredentialStore) {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "cmd-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: Some("cmd://my-cmd-cred".to_string()),
@@ -894,6 +889,7 @@ mod tests {
     async fn make_route_store(host: &str, port: u16, rules: Vec<EndpointRule>) -> RouteStore {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "test-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: None,
@@ -930,7 +926,7 @@ mod tests {
                 proxy_inject_mode: InjectMode::Header,
                 raw_credential: Zeroizing::new(secret.to_string()),
                 header_name: "Authorization".to_string(),
-                proxy_header_name: "Authorization".to_string(),
+                proxy_header_names: vec!["Authorization".to_string()],
                 header_value: Zeroizing::new(format!("Bearer {}", secret)),
                 extra_headers: Vec::new(),
                 path_pattern: None,
@@ -958,7 +954,7 @@ mod tests {
                 proxy_inject_mode: InjectMode::Header,
                 raw_credential: Zeroizing::new(secret.to_string()),
                 header_name: "Authorization".to_string(),
-                proxy_header_name: "Authorization".to_string(),
+                proxy_header_names: vec!["Authorization".to_string()],
                 header_value: Zeroizing::new(format!("Bearer {}", secret)),
                 extra_headers: vec![(
                     extra_name.to_string(),
@@ -1803,6 +1799,7 @@ mod tests {
         // Route configured for AWS SigV4 (h2 signing not yet implemented).
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "aws-svc".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
             credential_key: None,
@@ -2201,6 +2198,7 @@ mod tests {
         let routes = vec![
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "svc-a".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,
@@ -2229,6 +2227,7 @@ mod tests {
             },
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "svc-b".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,
@@ -2412,6 +2411,7 @@ mod tests {
     ) -> RouteStore {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "_ep_test".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: None,
@@ -2542,6 +2542,7 @@ mod tests {
         // catch-all and forward the request.
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "_ep_policy".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
             credential_key: None,
@@ -2752,6 +2753,7 @@ mod tests {
             // Credential catch-all (no endpoint_rules)
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "github-cred".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: Some("gh-token".to_string()),
@@ -2778,6 +2780,7 @@ mod tests {
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "_ep_localhost".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,

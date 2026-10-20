@@ -284,6 +284,8 @@ impl RouteStore {
                 normalized_prefix, route.upstream
             );
 
+            crate::config::validate_header_injection(&normalized_prefix, route)?;
+
             let endpoint_rules = CompiledEndpointRules::compile(&route.endpoint_rules)
                 .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
             let endpoint_policy = CompiledEndpointPolicy::compile(
@@ -1194,6 +1196,7 @@ mod tests {
         // Routes without credential_key should still be loaded into RouteStore
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "/openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: None,
@@ -1249,6 +1252,7 @@ mod tests {
     async fn test_load_routes_normalises_prefix() {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "/anthropic/".to_string(),
             upstream: "https://api.anthropic.com".to_string(),
             credential_key: None,
@@ -1282,6 +1286,7 @@ mod tests {
     async fn test_is_route_upstream() {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: None,
@@ -1326,6 +1331,7 @@ mod tests {
                 inject_mode: Default::default(),
                 inject_header: "Authorization".to_string(),
                 credential_format: None,
+                inject_headers: None,
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -1386,6 +1392,7 @@ mod tests {
         let routes = vec![
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -1411,6 +1418,7 @@ mod tests {
             },
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -1499,6 +1507,7 @@ mod tests {
     async fn test_route_store_matches_bracketed_ipv6_authority() -> Result<()> {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "local".to_string(),
             upstream: "http://[::1]:8080/v1".to_string(),
             credential_key: Some("local".to_string()),
@@ -1546,6 +1555,7 @@ mod tests {
         ] {
             let routes = vec![RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "bad".to_string(),
                 upstream: upstream.to_string(),
                 credential_key: None,
@@ -1736,6 +1746,7 @@ mod tests {
     async fn test_requires_intercept_credential_only() {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: Some("openai_api_key".to_string()),
@@ -1778,6 +1789,7 @@ mod tests {
     async fn test_requires_intercept_wildcard_credential_upstream() {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "internal_api".to_string(),
             upstream: "https://*.dev.example.net".to_string(),
             credential_key: Some("cmd://internal_api".to_string()),
@@ -1825,6 +1837,7 @@ mod tests {
         // interception.
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "internal".to_string(),
             upstream: "https://internal.example.com".to_string(),
             credential_key: None,
@@ -1865,6 +1878,7 @@ mod tests {
         // this upstream still gets the existing 403 (not intercepted).
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "alias".to_string(),
             upstream: "https://aliased.example.com".to_string(),
             credential_key: None,
@@ -1899,6 +1913,7 @@ mod tests {
         // managed-credential-unavailable gate.
         let routes = vec![RouteConfig {
             redeem_phantoms: vec!["partner-token".to_string()],
+            inject_headers: None,
             prefix: "partner-api".to_string(),
             upstream: "https://api.partner.example.com".to_string(),
             credential_key: None,
@@ -1937,6 +1952,7 @@ mod tests {
     async fn test_redeem_phantoms_rejected_with_aws_auth() {
         let route = RouteConfig {
             redeem_phantoms: vec!["partner-token".to_string()],
+            inject_headers: None,
             aws_auth: Some(crate::config::AwsAuthConfig::default()),
             prefix: "partner-api".to_string(),
             upstream: "https://api.partner.example.com".to_string(),
@@ -1975,6 +1991,7 @@ mod tests {
             inject_mode: Default::default(),
             inject_header: "Authorization".to_string(),
             credential_format: None,
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -2103,6 +2120,7 @@ mod tests {
     async fn test_lookup_by_upstream_returns_prefix() {
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: Some("openai_api_key".to_string()),
@@ -2161,6 +2179,7 @@ mod tests {
         let routes = vec![
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "github_org_a".to_string(),
                 upstream: "https://github.com".to_string(),
                 credential_key: Some("env://GH_TOKEN_A".to_string()),
@@ -2189,6 +2208,7 @@ mod tests {
             },
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "github_org_b".to_string(),
                 upstream: "https://github.com".to_string(),
                 credential_key: Some("env://GH_TOKEN_B".to_string()),
@@ -2271,6 +2291,7 @@ mod tests {
         fn gh_route(prefix: &str, env: &str, path: &str) -> RouteConfig {
             RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: prefix.to_string(),
                 upstream: "https://github.com".to_string(),
                 credential_key: Some(format!("env://{env}")),
@@ -2689,6 +2710,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
 
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "k8s".to_string(),
             upstream: "https://192.168.64.1:6443".to_string(),
             credential_key: None,

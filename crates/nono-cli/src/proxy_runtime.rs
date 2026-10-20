@@ -2698,6 +2698,7 @@ fn synthesize_credential_provider_proxy_config(
                         .clone()
                         .unwrap_or_else(|| "Bearer {}".to_string()),
                 ),
+                inject_headers: None,
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -5074,6 +5075,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
