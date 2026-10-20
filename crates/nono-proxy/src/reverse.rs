@@ -332,11 +332,11 @@ pub async fn handle_reverse_proxy(
     // `require_auth` is disabled (standalone `nono proxy --no-auth`).
     if ctx.require_auth {
         if let Some(cred) = cred {
-            if let Err(e) = validate_phantom_token_for_mode(
+            if let Err(e) = validate_phantom_token_for_mode_multi(
                 &cred.proxy_inject_mode,
                 remaining_header,
                 &upstream_path,
-                &cred.proxy_header_name,
+                &cred.proxy_header_names,
                 cred.proxy_path_pattern.as_deref(),
                 cred.proxy_query_param_name.as_deref(),
                 ctx.session_token,
@@ -360,11 +360,11 @@ pub async fn handle_reverse_proxy(
                 return Ok(());
             }
         } else if let Some(cmd) = cmd_route {
-            if let Err(e) = validate_phantom_token_for_mode(
+            if let Err(e) = validate_phantom_token_for_mode_multi(
                 &cmd.proxy_inject_mode,
                 remaining_header,
                 &upstream_path,
-                &cmd.proxy_header_name,
+                &cmd.proxy_header_names,
                 cmd.proxy_path_pattern.as_deref(),
                 cmd.proxy_query_param_name.as_deref(),
                 ctx.session_token,
@@ -568,8 +568,9 @@ pub async fn handle_reverse_proxy(
         }
     };
 
-    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = filter_headers(remaining_header, strip_header);
+    let empty_headers: [String; 0] = [];
+    let strip_headers: &[String] = cred.map_or(&empty_headers, |c| &c.proxy_header_names);
+    let filtered_headers = filter_headers_multi(remaining_header, strip_headers);
     let body = match read_request_body(stream, remaining_header, buffered_body).await? {
         Some(body) => body,
         None => return Ok(()),
@@ -1910,83 +1911,145 @@ fn validate_phantom_token(
     header_name: &str,
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
+    validate_phantom_token_any(
+        header_bytes,
+        std::slice::from_ref(&header_name),
+        session_token,
+    )
+}
+
+fn validate_phantom_token_any<S: AsRef<str>>(
+    header_bytes: &[u8],
+    header_names: &[S],
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
     let header_str = std::str::from_utf8(header_bytes).map_err(|_| ProxyError::InvalidToken)?;
-    let header_name_lower = header_name.to_lowercase();
+    let mut saw_listed = false;
 
     for line in header_str.lines() {
         // RFC 7230: folded headers are obsolete; reject to prevent parser divergence.
         if line.starts_with(' ') || line.starts_with('\t') {
             return Err(ProxyError::InvalidToken);
         }
-        let lower = line.to_lowercase();
-        if lower.starts_with(&format!("{}:", header_name_lower)) {
-            let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+        let Some((raw_name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = raw_name.trim();
+        if !header_names
+            .iter()
+            .any(|header| header.as_ref().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        saw_listed = true;
 
-            // Handle "Bearer <token>" format (strip "Bearer " prefix if present)
-            // Use case-insensitive check, then slice original value by length
-            let value_lower = value.to_lowercase();
-            let token_value = if value_lower.starts_with("bearer ") {
-                // "bearer ".len() == 7
-                value[7..].trim()
-            } else {
-                value
-            };
+        let value = raw_value.trim();
+        // Case-insensitive check, slice the original by length.
+        let value_lower = value.to_lowercase();
+        let token_value = if value_lower.starts_with("bearer ") {
+            value[7..].trim()
+        } else {
+            value
+        };
 
-            if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
-                return Ok(());
-            }
-            warn!("Invalid phantom token in {} header", header_name);
-            return Err(ProxyError::InvalidToken);
+        if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
+            return Ok(());
         }
     }
 
-    warn!(
-        "Missing {} header for phantom token validation",
-        header_name
-    );
+    if saw_listed {
+        warn!(
+            "Invalid phantom token in configured credential header(s): {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        warn!(
+            "Missing phantom token header; expected one of: {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Err(ProxyError::InvalidToken)
 }
 
 /// Validate the phantom token from a Basic auth header (`Basic base64(user:token)`).
-///
-/// Used for credential routes with `inject_mode: "basic_auth"`. The username is
-/// ignored; only the password field is compared against the session token.
+#[cfg(test)]
 fn validate_phantom_token_basic(
     header_bytes: &[u8],
     header_name: &str,
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
+    validate_phantom_token_basic_any(
+        header_bytes,
+        std::slice::from_ref(&header_name),
+        session_token,
+    )
+}
+
+fn validate_phantom_token_basic_any<S: AsRef<str>>(
+    header_bytes: &[u8],
+    header_names: &[S],
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
     let header_str = std::str::from_utf8(header_bytes).map_err(|_| ProxyError::InvalidToken)?;
-    let header_name_lower = header_name.to_lowercase();
     const BASIC_PREFIX: &str = "basic ";
+    let mut saw_listed = false;
 
     for line in header_str.lines() {
         // RFC 7230: folded headers are obsolete; reject to prevent parser divergence.
         if line.starts_with(' ') || line.starts_with('\t') {
             return Err(ProxyError::InvalidToken);
         }
-        let lower = line.to_lowercase();
-        if lower.starts_with(&format!("{}:", header_name_lower)) {
-            let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+        let Some((raw_name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = raw_name.trim();
+        if !header_names
+            .iter()
+            .any(|header| header.as_ref().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        saw_listed = true;
 
-            let value_lower = value.to_lowercase();
-            if !value_lower.starts_with(BASIC_PREFIX) {
-                warn!(
-                    "Expected Basic auth in {} header for basic_auth route",
-                    header_name
-                );
-                return Err(ProxyError::InvalidToken);
-            }
+        let value = raw_value.trim();
+        let value_lower = value.to_lowercase();
+        if !value_lower.starts_with(BASIC_PREFIX) {
+            continue;
+        }
 
-            let encoded = value[BASIC_PREFIX.len()..].trim();
-            return token::validate_basic_auth(encoded, session_token);
+        let encoded = value[BASIC_PREFIX.len()..].trim();
+        if token::validate_basic_auth(encoded, session_token).is_ok() {
+            return Ok(());
         }
     }
 
-    warn!(
-        "Missing {} header for phantom token validation",
-        header_name
-    );
+    if saw_listed {
+        warn!(
+            "Invalid or non-Basic phantom token in configured credential header(s): {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        warn!(
+            "Missing phantom token header; expected one of: {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Err(ProxyError::InvalidToken)
 }
 
@@ -2002,9 +2065,13 @@ fn validate_phantom_token_basic(
 /// the phantom token that must not be forwarded alongside the real credential).
 /// When `cred_header` is empty (no-credential route), all other headers
 /// including `Authorization` are passed through to the upstream.
-pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(String, String)> {
+pub(crate) fn filter_headers_multi<S: AsRef<str>>(
+    header_bytes: &[u8],
+    strip: &[S],
+) -> Vec<(String, String)> {
     let prefixes: Vec<String> = strip
         .iter()
+        .map(AsRef::as_ref)
         .filter(|h| !h.is_empty())
         .map(|h| format!("{}:", h.to_lowercase()))
         .collect();
@@ -2402,10 +2469,33 @@ pub(crate) fn validate_phantom_token_for_mode(
     query_param_name: Option<&str>,
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
+    validate_phantom_token_for_mode_multi(
+        mode,
+        header_bytes,
+        path,
+        std::slice::from_ref(&header_name),
+        path_pattern,
+        query_param_name,
+        session_token,
+    )
+}
+
+/// Validate the phantom token from any of several inbound headers: a match in
+/// any listed header authorizes; an invalid value in a listed header does not
+/// authorize.
+pub(crate) fn validate_phantom_token_for_mode_multi<S: AsRef<str>>(
+    mode: &InjectMode,
+    header_bytes: &[u8],
+    path: &str,
+    header_names: &[S],
+    path_pattern: Option<&str>,
+    query_param_name: Option<&str>,
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
     match mode {
-        InjectMode::Header => validate_phantom_token(header_bytes, header_name, session_token),
+        InjectMode::Header => validate_phantom_token_any(header_bytes, header_names, session_token),
         InjectMode::BasicAuth => {
-            validate_phantom_token_basic(header_bytes, header_name, session_token)
+            validate_phantom_token_basic_any(header_bytes, header_names, session_token)
         }
         InjectMode::UrlPath => {
             // Validate from URL path
@@ -3171,6 +3261,102 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_phantom_token_accepts_either_configured_header() {
+        let token = Zeroizing::new("secret123".to_string());
+        let names = vec!["x-api-key".to_string(), "Authorization".to_string()];
+        for header in [
+            b"x-api-key: secret123\r\n\r\n".as_slice(),
+            b"Authorization: Bearer secret123\r\n\r\n".as_slice(),
+        ] {
+            assert!(
+                validate_phantom_token_for_mode_multi(
+                    &InjectMode::Header,
+                    header,
+                    "/zen/v1/models",
+                    &names,
+                    None,
+                    None,
+                    &token,
+                )
+                .is_ok(),
+                "phantom must be accepted in either configured header: {}",
+                String::from_utf8_lossy(header)
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_phantom_token_rejects_when_no_configured_header_matches() {
+        let token = Zeroizing::new("secret123".to_string());
+        let names = vec!["x-api-key".to_string(), "Authorization".to_string()];
+
+        let wrong_values = b"x-api-key: wrong\r\nAuthorization: Bearer wrong\r\n\r\n";
+        assert!(
+            validate_phantom_token_for_mode_multi(
+                &InjectMode::Header,
+                wrong_values,
+                "/zen/v1/models",
+                &names,
+                None,
+                None,
+                &token,
+            )
+            .is_err()
+        );
+
+        let unrelated_header = b"Cookie: secret123\r\n\r\n";
+        assert!(
+            validate_phantom_token_for_mode_multi(
+                &InjectMode::Header,
+                unrelated_header,
+                "/zen/v1/models",
+                &names,
+                None,
+                None,
+                &token,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_multi_strips_every_credential_header() {
+        let header = b"x-api-key: phantom\r\nAuthorization: Bearer phantom\r\nContent-Type: application/json\r\n\r\n";
+        let filtered = filter_headers_multi(header, &["x-api-key", "Authorization"]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "Content-Type");
+    }
+
+    #[test]
+    fn test_inject_credential_writes_every_header() {
+        let cred = LoadedCredential {
+            inject_mode: InjectMode::Header,
+            proxy_inject_mode: InjectMode::Header,
+            raw_credential: Zeroizing::new("real-key".to_string()),
+            header_name: "x-api-key".to_string(),
+            proxy_header_names: vec!["x-api-key".to_string(), "Authorization".to_string()],
+            header_value: Zeroizing::new("real-key".to_string()),
+            extra_headers: vec![(
+                "Authorization".to_string(),
+                Zeroizing::new("Bearer real-key".to_string()),
+            )],
+            path_pattern: None,
+            proxy_path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy_query_param_name: None,
+        };
+        let mut request = Zeroizing::new("GET /zen/v1/models HTTP/1.1\r\n".to_string());
+        inject_credential_for_mode(&cred, &mut request);
+        assert!(request.contains("x-api-key: real-key\r\n"));
+        assert!(request.contains("Authorization: Bearer real-key\r\n"));
+        assert_eq!(
+            injected_credential_header_names(Some(&cred)),
+            vec!["x-api-key".to_string(), "authorization".to_string()]
+        );
+    }
+
+    #[test]
     fn test_filter_headers_removes_host_auth() {
         let header = b"Host: localhost:8080\r\nAuthorization: Bearer old\r\nContent-Type: application/json\r\nAccept: */*\r\n\r\n";
         let filtered = filter_headers(header, "Authorization");
@@ -3202,7 +3388,7 @@ mod tests {
             proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new(String::new()),
             header_name: "Authorization".to_string(),
-            proxy_header_name: "Authorization".to_string(),
+            proxy_header_names: vec!["Authorization".to_string()],
             header_value: Zeroizing::new("Bearer real".to_string()),
             extra_headers: vec![(
                 "X-Gateway-Key".to_string(),
@@ -3233,7 +3419,7 @@ mod tests {
             proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new(String::new()),
             header_name: "Authorization".to_string(),
-            proxy_header_name: "Authorization".to_string(),
+            proxy_header_names: vec!["Authorization".to_string()],
             header_value: Zeroizing::new("Bearer real".to_string()),
             extra_headers: vec![(
                 "X-Gateway-Key".to_string(),
@@ -3275,7 +3461,7 @@ mod tests {
             proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new(String::new()),
             header_name: "Authorization".to_string(),
-            proxy_header_name: "Authorization".to_string(),
+            proxy_header_names: vec!["Authorization".to_string()],
             header_value: Zeroizing::new(String::new()),
             extra_headers: vec![(
                 "X-Gateway-Key".to_string(),
