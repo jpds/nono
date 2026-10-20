@@ -536,6 +536,7 @@ An individual entry in the `custom_credentials` map is configured as follows:
 | `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
 | `inject_header`     | string          | header mode | HTTP header name. Default: `"Authorization"`. |
 | `credential_format` | string          | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
+| `inject_headers`    | array           | no          | Inject the same credential into extra headers, each `{"header": ..., "format": ...}`. `inject_header` / `credential_format` still apply; header mode with `credential_key` only. |
 | `path_pattern`      | string          | url_path    | Pattern to match in URL path. Use `{}` for placeholder. |
 | `path_replacement`  | string          | url_path    | Replacement pattern. Defaults to `path_pattern`. |
 | `query_param_name`  | string          | query_param | Query parameter name for credential injection. |
@@ -547,6 +548,8 @@ An individual entry in the `custom_credentials` map is configured as follows:
 | `tls_client_key`    | string (path)   | no          | Path to the PEM-encoded private key matching `tls_client_cert`. |
 
 `proxy` overrides apply only to how the local proxy validates incoming phantom tokens from the sandboxed process. Outbound upstream credential injection continues to use top-level fields.
+
+With `inject_headers`, `inject_header` / `credential_format` still inject the credential into its own header (default `Authorization: Bearer {}`); the list only adds headers, so only the extra ones a provider needs are listed. The client's single phantom token is accepted in every injected header, those headers are stripped from the inbound request, and all of them are set to the formatted real credential. An entry naming `inject_header` overrides its template. `proxy.inject_header`, when set, must name `inject_header` or a listed header and narrows inbound validation to that header. Hop-by-hop and authority-changing headers such as `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Proxy-Authorization`, or `Upgrade` are rejected.
 
 ### credential_capture
 

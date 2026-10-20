@@ -3268,6 +3268,13 @@ fn resolve_to_manifest(
     // schema, so only static-key credentials are exported.
     let mut credentials = Vec::new();
     for (name, cred) in &prof.network.custom_credentials {
+        if cred.inject_headers.is_some() {
+            return Err(NonoError::ConfigParse(format!(
+                "custom credential '{name}' uses 'inject_headers', which the capability \
+                 manifest cannot represent (one header per credential); resolve to a \
+                 profile or drop the extra headers"
+            )));
+        }
         let inject_mode = match cred.inject_mode {
             profile::InjectMode::Header => manifest::InjectMode::Header,
             profile::InjectMode::UrlPath => manifest::InjectMode::UrlPath,
