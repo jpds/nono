@@ -1923,6 +1923,7 @@ fn collect_tool_sandbox_proxy_grants(
                 .clone()
                 .unwrap_or_else(|| "Authorization".to_string()),
             credential_format: credential.credential_format.clone(),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -4253,6 +4254,7 @@ mod tests {
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: Some("Bearer {}".to_string()),
+                inject_headers: None,
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,

@@ -287,6 +287,15 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub credential_format: Option<String>,
 
+    /// Inject the same credential into extra headers, each with its own value
+    /// template. Requires header mode and `credential_key`.
+    ///
+    /// `inject_header` and `credential_format` still inject the primary header.
+    /// The phantom is accepted in every injected header unless
+    /// `proxy.inject_header` narrows it to one.
+    #[serde(default)]
+    pub inject_headers: Option<Vec<nono_proxy::config::HeaderInjectionConfig>>,
+
     // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
     /// Example: "/bot{}/" matches "/bot<token>/getMe"
@@ -712,6 +721,10 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     // Validate upstream URL (HTTPS required, HTTP only for loopback)
     validate_upstream_url(&cred.upstream, name)?;
 
+    if let Some(headers) = cred.inject_headers.as_deref() {
+        validate_inject_headers(name, cred, headers)?;
+    }
+
     // Mode-specific validation (only applies to credential_key-based routes,
     // not OAuth2 routes which always inject as Bearer header)
     if cred.credential_key.is_some() {
@@ -964,25 +977,116 @@ fn validate_aws_auth(name: &str, aws: &nono_proxy::config::AwsAuthConfig) -> Res
 
 /// Validate header injection mode fields.
 /// Validate a single header name: non-empty, valid HTTP token characters only.
+///
+/// Errors report the name as `inject_header`.
 fn validate_header_name(cred_name: &str, header: &str) -> Result<()> {
+    validate_header_token("inject_header", cred_name, header)
+}
+
+/// Validate a header name, naming `field` in the error: non-empty and a valid
+/// HTTP token.
+fn validate_header_token(field: &str, cred_name: &str, header: &str) -> Result<()> {
     if header.is_empty() {
         return Err(NonoError::ProfileParse(format!(
-            "inject_header for custom credential '{}' cannot be empty",
-            cred_name
+            "{field} for custom credential '{cred_name}' cannot be empty"
         )));
     }
     if !nono_proxy::config::is_http_header_token(header) {
         return Err(NonoError::ProfileParse(format!(
-            "inject_header '{}' for custom credential '{}' contains invalid characters; \
-             header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
-            header, cred_name
+            "{field} '{header}' for custom credential '{cred_name}' contains invalid characters; \
+             header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)"
         )));
     }
     Ok(())
 }
 
+/// Rejects `inject_headers` combinations the runtime cannot honor, so a list
+/// is never half-applied.
+fn validate_inject_headers(
+    name: &str,
+    cred: &CustomCredentialDef,
+    headers: &[nono_proxy::config::HeaderInjectionConfig],
+) -> Result<()> {
+    if headers.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_headers for custom credential '{name}' cannot be empty; \
+             omit it to use inject_header"
+        )));
+    }
+    if cred.inject_mode != InjectMode::Header {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_headers for custom credential '{name}' requires inject_mode \"header\""
+        )));
+    }
+    if cred.credential_key.is_none() {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_headers for custom credential '{name}' requires credential_key; \
+             there is no static secret to format into the listed headers"
+        )));
+    }
+    if cred.auth.is_some() || cred.aws_auth.is_some() || cred.spiffe.is_some() {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_headers for custom credential '{name}' cannot be combined with \
+             auth, aws_auth, or spiffe; those mechanisms own their own injection"
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for (index, entry) in headers.iter().enumerate() {
+        let field = format!("inject_headers[{index}].header");
+        validate_header_token(&field, name, &entry.header)?;
+        if nono_proxy::config::is_forbidden_injected_header(&entry.header) {
+            return Err(NonoError::ProfileParse(format!(
+                "inject_headers[{index}].header for custom credential '{name}' cannot be \
+                 hop-by-hop or authority-changing header '{}'",
+                entry.header
+            )));
+        }
+        if !seen.insert(entry.header.to_ascii_lowercase()) {
+            return Err(NonoError::ProfileParse(format!(
+                "inject_headers for custom credential '{name}' lists header '{}' more than once",
+                entry.header
+            )));
+        }
+        let format =
+            nono_proxy::config::resolved_credential_format(&entry.header, entry.format.as_deref());
+        if format.contains('\r') || format.contains('\n') {
+            return Err(NonoError::ProfileParse(format!(
+                "inject_headers[{index}].format for custom credential '{name}' contains invalid \
+                 CRLF characters; this could enable header injection attacks"
+            )));
+        }
+    }
+
+    // Fail secure: h2/TLS-intercept forwarding strips only outbound header
+    // names, so narrowing to a header the route never injects leaks the
+    // client's phantom copy upstream.
+    if let Some(proxy_header) = cred
+        .proxy
+        .as_ref()
+        .and_then(|p| p.inject_header.as_deref())
+        .filter(|proxy_header| {
+            !cred.inject_header.eq_ignore_ascii_case(proxy_header)
+                && !headers
+                    .iter()
+                    .any(|entry| entry.header.eq_ignore_ascii_case(proxy_header))
+        })
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "proxy.inject_header '{proxy_header}' for custom credential '{name}' is neither \
+             the inject_header nor one of the inject_headers entries, so it would never be \
+             stripped and the phantom token would leak"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate header-mode fields: `inject_header` is a valid token and the
+/// effective `credential_format` carries no CRLF.
 fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
     // Validate inject_header
+    // It injects the primary header even when `inject_headers` adds extras, so
+    // the list cannot stand in for it.
     if cred.inject_header.is_empty() {
         return Err(NonoError::ProfileParse(format!(
             "inject_header for custom credential '{}' cannot be empty",
@@ -1238,6 +1342,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
         inject_mode,
         inject_header,
         credential_format,
+        inject_headers: None,
         path_pattern,
         path_replacement,
         query_param_name,
@@ -5625,6 +5730,7 @@ mod tests {
     }
 
     // ============================================================================
+
     // Custom credential validation integration tests
     //
     // These test the full validation chain including:
@@ -5643,6 +5749,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -5662,6 +5769,123 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_valid() {
         let cred = header_cred_builder();
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    fn multi_header(header: &str, format: &str) -> nono_proxy::config::HeaderInjectionConfig {
+        nono_proxy::config::HeaderInjectionConfig {
+            header: header.to_string(),
+            format: Some(format.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_validate_custom_credential_accepts_multi_header_injection() {
+        let mut cred = header_cred_builder();
+        cred.inject_headers = Some(vec![
+            multi_header("x-api-key", "{}"),
+            multi_header("x-session-token", "{}"),
+        ]);
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_rejects_multi_header_for_non_header_mode() {
+        let mut cred = header_cred_builder();
+        cred.inject_mode = InjectMode::QueryParam;
+        cred.query_param_name = Some("key".to_string());
+        cred.inject_headers = Some(vec![multi_header("x-api-key", "{}")]);
+
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("query_param mode cannot use inject_headers");
+        assert!(err.to_string().contains("inject_mode"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_custom_credential_rejects_duplicate_multi_headers() {
+        let mut cred = header_cred_builder();
+        cred.inject_headers = Some(vec![
+            multi_header("x-api-key", "{}"),
+            multi_header("X-Api-Key", "{}"),
+        ]);
+
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("duplicate header names must be rejected");
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_custom_credential_rejects_multi_header_crlf_format() {
+        let mut cred = header_cred_builder();
+        cred.inject_headers = Some(vec![multi_header("x-api-key", "a\r\nX-Injected: b")]);
+
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("CRLF in a header template must be rejected");
+        assert!(err.to_string().contains("CRLF"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_custom_credential_rejects_hop_by_hop_multi_header() {
+        let mut cred = header_cred_builder();
+        cred.inject_headers = Some(vec![multi_header("Host", "{}")]);
+
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("authority-changing headers must be rejected");
+        assert!(err.to_string().contains("hop-by-hop"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_custom_credential_multi_header_requires_credential_key() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["partner_token".to_string()];
+        cred.inject_headers = Some(vec![multi_header("x-api-key", "{}")]);
+
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("multi-header injection needs a static credential");
+        assert!(err.to_string().contains("requires credential_key"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_custom_credential_rejects_multi_header_phantom_override_outside_list() {
+        let mut cred = header_cred_builder();
+        cred.inject_headers = Some(vec![multi_header("x-api-key", "{}")]);
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: None,
+            inject_header: Some("x-custom-auth".to_string()),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("a phantom override the route never injects must be rejected");
+        assert!(
+            err.to_string()
+                .contains("is neither the inject_header nor one of"),
+            "{err}"
+        );
+
+        // Narrowing to the primary header stays valid: it is injected too.
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: None,
+            inject_header: Some("Authorization".to_string()),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+        assert!(validate_custom_credential("test", &cred).is_ok());
+
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: None,
+            inject_header: Some("X-API-KEY".to_string()),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
@@ -5950,6 +6174,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: None,
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6066,6 +6291,7 @@ mod tests {
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: None,
             query_param_name: None,
@@ -6093,6 +6319,7 @@ mod tests {
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None, // Missing required field
             path_replacement: None,
             query_param_name: None,
@@ -6122,6 +6349,7 @@ mod tests {
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: Some("/bot/token/".to_string()), // No {} placeholder
             path_replacement: None,
             query_param_name: None,
@@ -6151,6 +6379,7 @@ mod tests {
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot{}/".to_string()),
             query_param_name: None,
@@ -6178,6 +6407,7 @@ mod tests {
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot/fixed/".to_string()), // No {} placeholder
             query_param_name: None,
@@ -6207,6 +6437,7 @@ mod tests {
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("key".to_string()),
@@ -6234,6 +6465,7 @@ mod tests {
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None, // Missing required field
@@ -6263,6 +6495,7 @@ mod tests {
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("".to_string()), // Empty
@@ -6292,6 +6525,7 @@ mod tests {
             inject_mode: InjectMode::BasicAuth,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6500,6 +6734,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -7454,6 +7689,7 @@ mod tests {
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: Some("Bearer {}".to_string()),
+                inject_headers: None,
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -7481,6 +7717,7 @@ mod tests {
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: Some("Token {}".to_string()),
+                inject_headers: None,
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -7645,6 +7882,7 @@ mod tests {
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: Some("Bearer {}".to_string()),
+                inject_headers: None,
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -7672,6 +7910,7 @@ mod tests {
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: Some("Token {}".to_string()),
+                inject_headers: None,
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -9892,6 +10131,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -9922,6 +10162,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -9955,6 +10196,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -9988,6 +10230,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -10053,6 +10296,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -10547,6 +10791,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: Some("Bearer {}".to_string()),
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -11358,6 +11603,7 @@ mod tests {
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: None,
+            inject_headers: None,
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,

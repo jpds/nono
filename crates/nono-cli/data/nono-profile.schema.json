@@ -1149,6 +1149,17 @@
           ],
           "description": "Template with {} for the secret (header inject mode). If set, used as-is. If omitted: Authorization header (case-insensitive) defaults to Bearer {}; other headers default to {} (secret only)."
         },
+        "inject_headers": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": { "$ref": "#/$defs/HeaderInjectionConfig" },
+              "minItems": 1
+            },
+            { "type": "null" }
+          ],
+          "description": "Inject the same credential into additional headers, each with its own template. Only valid with inject_mode \"header\" and credential_key. inject_header/credential_format still inject the credential into its own header (default Authorization with Bearer {}); each listed header gets the same credential; an entry naming inject_header overrides its template. The phantom token is accepted in every injected header unless proxy.inject_header names one of them and narrows it."
+        },
         "path_pattern": {
           "oneOf": [
             { "type": "string" },
@@ -1274,6 +1285,27 @@
       "enum": ["header", "url_path", "query_param", "basic_auth"],
       "description": "Credential injection mode for the reverse proxy.",
       "default": "header"
+    },
+    "HeaderInjectionConfig": {
+      "type": "object",
+      "description": "One outbound header populated from the same route credential. Use a list of these to present one secret under several header shapes, such as x-api-key and Authorization: Bearer.",
+      "additionalProperties": false,
+      "required": ["header"],
+      "properties": {
+        "header": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$",
+          "description": "HTTP header name, such as x-api-key or Authorization."
+        },
+        "format": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Value template; {} is replaced by the secret. Defaults (case-insensitive match on the header name) to \"Bearer {}\" for Authorization and \"{}\" for any other header."
+        }
+      }
     },
     "ProxyInjectConfig": {
       "type": "object",
