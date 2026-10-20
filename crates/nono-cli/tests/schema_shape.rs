@@ -476,6 +476,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "inject_mode",
             "inject_header",
             "credential_format",
+            "inject_headers",
             "path_pattern",
             "path_replacement",
             "query_param_name",
@@ -489,6 +490,35 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "rate_limit",
             "redeem_phantoms",
         ],
+    );
+}
+
+#[test]
+fn test_schema_validates_custom_credential_multi_header_injection() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "custom_credentials": {
+                "my_api": {
+                    "upstream": "https://api.example.com",
+                    "credential_key": "env://MY_API_KEY",
+                    "inject_headers": [{ "header": "x-api-key", "format": "{}" }]
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("multi-header credential should validate");
+
+    let mut unknown_field = profile.clone();
+    unknown_field["network"]["custom_credentials"]["my_api"]["inject_headers"][0]["template"] =
+        json!("{}");
+    assert!(
+        validator.validate(&unknown_field).is_err(),
+        "unknown fields inside inject_headers entries must be rejected"
     );
 }
 
