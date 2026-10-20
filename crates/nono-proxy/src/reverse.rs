@@ -332,11 +332,11 @@ pub async fn handle_reverse_proxy(
     // `require_auth` is disabled (standalone `nono proxy --no-auth`).
     if ctx.require_auth {
         if let Some(cred) = cred {
-            if let Err(e) = validate_phantom_token_for_mode(
+            if let Err(e) = validate_phantom_token_for_mode_multi(
                 &cred.proxy_inject_mode,
                 remaining_header,
                 &upstream_path,
-                &cred.proxy_header_name,
+                &cred.proxy_header_names,
                 cred.proxy_path_pattern.as_deref(),
                 cred.proxy_query_param_name.as_deref(),
                 ctx.session_token,
@@ -360,11 +360,11 @@ pub async fn handle_reverse_proxy(
                 return Ok(());
             }
         } else if let Some(cmd) = cmd_route {
-            if let Err(e) = validate_phantom_token_for_mode(
+            if let Err(e) = validate_phantom_token_for_mode_multi(
                 &cmd.proxy_inject_mode,
                 remaining_header,
                 &upstream_path,
-                &cmd.proxy_header_name,
+                &cmd.proxy_header_names,
                 cmd.proxy_path_pattern.as_deref(),
                 cmd.proxy_query_param_name.as_deref(),
                 ctx.session_token,
@@ -568,8 +568,7 @@ pub async fn handle_reverse_proxy(
         }
     };
 
-    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = filter_headers(remaining_header, strip_header);
+    let filtered_headers = filter_headers_multi(remaining_header, credential_strip_headers(cred));
     let body = match read_request_body(stream, remaining_header, buffered_body).await? {
         Some(body) => body,
         None => return Ok(()),
@@ -656,8 +655,9 @@ pub async fn handle_reverse_proxy(
 ///
 /// Validate the localhost auth boundary for SPIFFE reverse-proxy requests.
 ///
-/// Accepts `Proxy-Authorization` (forward-proxy style via `HTTP_PROXY`) or
-/// `Authorization: Bearer <session-token>` (SDK / `*_BASE_URL` style).
+/// Accepts `Proxy-Authorization` (forward-proxy style via `HTTP_PROXY`), or the
+/// session token in `Authorization` (SDK / `*_BASE_URL` style) or bare
+/// `x-api-key` (clients such as the Claude CLI send the key without a prefix).
 fn validate_reverse_local_auth(
     remaining_header: &[u8],
     upstream_path: &str,
@@ -666,27 +666,11 @@ fn validate_reverse_local_auth(
     if token::validate_proxy_auth(remaining_header, session_token).is_ok() {
         return Ok(());
     }
-    // Try Authorization: Bearer <token> first (standard pattern).
-    if validate_phantom_token_for_mode(
+    validate_phantom_token_for_mode_multi(
         &crate::config::InjectMode::Header,
         remaining_header,
         upstream_path,
-        "Authorization",
-        None,
-        None,
-        session_token,
-    )
-    .is_ok()
-    {
-        return Ok(());
-    }
-    // Also accept x-api-key: <token> for clients (e.g. claude CLI) that send
-    // the API key directly without a Bearer prefix.
-    validate_phantom_token_for_mode(
-        &crate::config::InjectMode::Header,
-        remaining_header,
-        upstream_path,
-        "x-api-key",
+        &["Authorization", "x-api-key"],
         None,
         None,
         session_token,
@@ -1951,83 +1935,145 @@ fn validate_phantom_token(
     header_name: &str,
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
+    validate_phantom_token_any(
+        header_bytes,
+        std::slice::from_ref(&header_name),
+        session_token,
+    )
+}
+
+fn validate_phantom_token_any<S: AsRef<str>>(
+    header_bytes: &[u8],
+    header_names: &[S],
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
     let header_str = std::str::from_utf8(header_bytes).map_err(|_| ProxyError::InvalidToken)?;
-    let header_name_lower = header_name.to_lowercase();
+    let mut saw_listed = false;
 
     for line in header_str.lines() {
         // RFC 7230: folded headers are obsolete; reject to prevent parser divergence.
         if line.starts_with(' ') || line.starts_with('\t') {
             return Err(ProxyError::InvalidToken);
         }
-        let lower = line.to_lowercase();
-        if lower.starts_with(&format!("{}:", header_name_lower)) {
-            let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+        let Some((raw_name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = raw_name.trim();
+        if !header_names
+            .iter()
+            .any(|header| header.as_ref().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        saw_listed = true;
 
-            // Handle "Bearer <token>" format (strip "Bearer " prefix if present)
-            // Use case-insensitive check, then slice original value by length
-            let value_lower = value.to_lowercase();
-            let token_value = if value_lower.starts_with("bearer ") {
-                // "bearer ".len() == 7
-                value[7..].trim()
-            } else {
-                value
-            };
+        let value = raw_value.trim();
+        // Case-insensitive check, slice the original by length.
+        let value_lower = value.to_lowercase();
+        let token_value = if value_lower.starts_with("bearer ") {
+            value[7..].trim()
+        } else {
+            value
+        };
 
-            if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
-                return Ok(());
-            }
-            warn!("Invalid phantom token in {} header", header_name);
-            return Err(ProxyError::InvalidToken);
+        if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
+            return Ok(());
         }
     }
 
-    warn!(
-        "Missing {} header for phantom token validation",
-        header_name
-    );
+    if saw_listed {
+        warn!(
+            "Invalid phantom token in configured credential header(s): {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        warn!(
+            "Missing phantom token header; expected one of: {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Err(ProxyError::InvalidToken)
 }
 
 /// Validate the phantom token from a Basic auth header (`Basic base64(user:token)`).
-///
-/// Used for credential routes with `inject_mode: "basic_auth"`. The username is
-/// ignored; only the password field is compared against the session token.
+#[cfg(test)]
 fn validate_phantom_token_basic(
     header_bytes: &[u8],
     header_name: &str,
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
+    validate_phantom_token_basic_any(
+        header_bytes,
+        std::slice::from_ref(&header_name),
+        session_token,
+    )
+}
+
+fn validate_phantom_token_basic_any<S: AsRef<str>>(
+    header_bytes: &[u8],
+    header_names: &[S],
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
     let header_str = std::str::from_utf8(header_bytes).map_err(|_| ProxyError::InvalidToken)?;
-    let header_name_lower = header_name.to_lowercase();
     const BASIC_PREFIX: &str = "basic ";
+    let mut saw_listed = false;
 
     for line in header_str.lines() {
         // RFC 7230: folded headers are obsolete; reject to prevent parser divergence.
         if line.starts_with(' ') || line.starts_with('\t') {
             return Err(ProxyError::InvalidToken);
         }
-        let lower = line.to_lowercase();
-        if lower.starts_with(&format!("{}:", header_name_lower)) {
-            let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+        let Some((raw_name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = raw_name.trim();
+        if !header_names
+            .iter()
+            .any(|header| header.as_ref().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        saw_listed = true;
 
-            let value_lower = value.to_lowercase();
-            if !value_lower.starts_with(BASIC_PREFIX) {
-                warn!(
-                    "Expected Basic auth in {} header for basic_auth route",
-                    header_name
-                );
-                return Err(ProxyError::InvalidToken);
-            }
+        let value = raw_value.trim();
+        let value_lower = value.to_lowercase();
+        if !value_lower.starts_with(BASIC_PREFIX) {
+            continue;
+        }
 
-            let encoded = value[BASIC_PREFIX.len()..].trim();
-            return token::validate_basic_auth(encoded, session_token);
+        let encoded = value[BASIC_PREFIX.len()..].trim();
+        if token::validate_basic_auth(encoded, session_token).is_ok() {
+            return Ok(());
         }
     }
 
-    warn!(
-        "Missing {} header for phantom token validation",
-        header_name
-    );
+    if saw_listed {
+        warn!(
+            "Invalid or non-Basic phantom token in configured credential header(s): {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        warn!(
+            "Missing phantom token header; expected one of: {}",
+            header_names
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Err(ProxyError::InvalidToken)
 }
 
@@ -2043,9 +2089,19 @@ fn validate_phantom_token_basic(
 /// the phantom token that must not be forwarded alongside the real credential).
 /// When `cred_header` is empty (no-credential route), all other headers
 /// including `Authorization` are passed through to the upstream.
-pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(String, String)> {
+pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
+    filter_headers_multi(header_bytes, &[cred_header])
+}
+
+/// [`filter_headers`] with every credential header to strip. Empty names are
+/// skipped, so a route with no credential passes `""`.
+pub(crate) fn filter_headers_multi<S: AsRef<str>>(
+    header_bytes: &[u8],
+    strip: &[S],
+) -> Vec<(String, String)> {
     let prefixes: Vec<String> = strip
         .iter()
+        .map(AsRef::as_ref)
         .filter(|h| !h.is_empty())
         .map(|h| format!("{}:", h.to_lowercase()))
         .collect();
@@ -2068,36 +2124,6 @@ pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(
             headers.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
-    headers
-}
-
-pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
-    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
-    let cred_header_lower = if cred_header.is_empty() {
-        String::new()
-    } else {
-        format!("{}:", cred_header.to_lowercase())
-    };
-    let mut headers = Vec::new();
-
-    for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:")
-            || lower.starts_with("content-length:")
-            || lower.starts_with("transfer-encoding:")
-            || lower.starts_with("connection:")
-            || lower.starts_with("proxy-connection:")
-            || lower.starts_with("proxy-authorization:")
-            || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
-            || line.trim().is_empty()
-        {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
-        }
-    }
-
     headers
 }
 
@@ -2427,14 +2453,8 @@ fn log_upgrade_rejection(
 // Injection mode helpers
 // ============================================================================
 
-/// Validate phantom token based on injection mode.
-///
-/// Different modes extract the phantom token from different locations:
-/// - `Header`: From the auth header (Bearer or bare token)
-/// - `BasicAuth`: From the auth header (`Basic base64(user:token)`)
-/// - `UrlPath`: From the URL path pattern (e.g., `/bot<token>/getMe`)
-/// - `QueryParam`: From the query parameter (e.g., `?api_key=<token>`)
-pub(crate) fn validate_phantom_token_for_mode(
+#[cfg(test)]
+fn validate_phantom_token_for_mode(
     mode: &InjectMode,
     header_bytes: &[u8],
     path: &str,
@@ -2443,20 +2463,41 @@ pub(crate) fn validate_phantom_token_for_mode(
     query_param_name: Option<&str>,
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
+    validate_phantom_token_for_mode_multi(
+        mode,
+        header_bytes,
+        path,
+        std::slice::from_ref(&header_name),
+        path_pattern,
+        query_param_name,
+        session_token,
+    )
+}
+
+/// Validate the phantom token in `mode`, accepting it in any of `header_names`
+/// for the header modes; one match authorizes, a listed header carrying any
+/// other value does not.
+pub(crate) fn validate_phantom_token_for_mode_multi<S: AsRef<str>>(
+    mode: &InjectMode,
+    header_bytes: &[u8],
+    path: &str,
+    header_names: &[S],
+    path_pattern: Option<&str>,
+    query_param_name: Option<&str>,
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
     match mode {
-        InjectMode::Header => validate_phantom_token(header_bytes, header_name, session_token),
+        InjectMode::Header => validate_phantom_token_any(header_bytes, header_names, session_token),
         InjectMode::BasicAuth => {
-            validate_phantom_token_basic(header_bytes, header_name, session_token)
+            validate_phantom_token_basic_any(header_bytes, header_names, session_token)
         }
         InjectMode::UrlPath => {
-            // Validate from URL path
             let pattern = path_pattern.ok_or_else(|| {
                 ProxyError::HttpParse("url_path mode requires path_pattern".to_string())
             })?;
             validate_phantom_token_in_path(path, pattern, session_token)
         }
         InjectMode::QueryParam => {
-            // Validate from query parameter
             let param_name = query_param_name.ok_or_else(|| {
                 ProxyError::HttpParse("query_param mode requires query_param_name".to_string())
             })?;
@@ -2814,30 +2855,19 @@ fn strip_proxy_query_param(path: &str, param_name: &str) -> String {
     }
 }
 
-/// Inject credential into request based on mode.
+/// Add the credential's headers to a structured `http::Request` builder.
 ///
-/// For header/basic_auth modes, adds the credential header.
-/// For url_path/query_param modes, the credential is already in the path.
-/// Inject credential into a structured `http::Request` builder.
+/// `injected_credential_header_names` strips client-supplied copies of all
+/// these names, so they must be re-added here or be lost entirely.
 fn inject_credential_structured(
     cred: &LoadedCredential,
     builder: http::request::Builder,
 ) -> http::request::Builder {
     match cred.inject_mode {
-        InjectMode::Header | InjectMode::BasicAuth => {
-            // Mirror `inject_credential_for_mode` (the HTTP/1.1 raw-string path):
-            // inject the primary header plus every materialized extra header.
-            // `injected_credential_header_names` strips client-supplied copies of
-            // all these names, so they must be re-added here or be lost entirely.
-            let mut builder = builder;
-            if !cred.header_value.is_empty() {
-                builder = builder.header(cred.header_name.as_str(), cred.header_value.as_str());
-            }
-            for (name, value) in &cred.extra_headers {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-            builder
-        }
+        InjectMode::Header | InjectMode::BasicAuth => injected_credential_pairs(cred)
+            .fold(builder, |builder, (name, value)| {
+                builder.header(name, value)
+            }),
         InjectMode::UrlPath | InjectMode::QueryParam => builder,
     }
 }
@@ -2873,33 +2903,46 @@ pub(crate) fn transform_path_for_credential(
     )
 }
 
+/// Add the credential's headers to raw HTTP/1.1 request bytes. For
+/// url_path/query_param modes the credential is already in the request target.
 pub(crate) fn inject_credential_for_mode(cred: &LoadedCredential, request: &mut Zeroizing<String>) {
-    match cred.inject_mode {
-        InjectMode::Header | InjectMode::BasicAuth => {
-            // Inject credential header
-            if !cred.header_value.is_empty() {
-                request.push_str(&format!(
-                    "{}: {}\r\n",
-                    cred.header_name,
-                    cred.header_value.as_str()
-                ));
-            }
-            for (name, value) in &cred.extra_headers {
-                request.push_str(&format!("{}: {}\r\n", name, value.as_str()));
-            }
-        }
-        InjectMode::UrlPath | InjectMode::QueryParam => {
-            // Credential is already injected into the URL path/query
-            // No header injection needed
-        }
+    if !matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth) {
+        return;
+    }
+    for (name, value) in injected_credential_pairs(cred) {
+        request.push_str(&format!("{name}: {value}\r\n"));
     }
 }
 
+/// Header name/value pairs to inject upstream: the primary header when it has a
+/// value, then every extra header. Shared by the HTTP/1.1, h2, and structured
+/// builders so no forwarding path drops the extras.
+pub(crate) fn injected_credential_pairs(
+    cred: &LoadedCredential,
+) -> impl Iterator<Item = (&str, &str)> {
+    (!cred.header_value.is_empty())
+        .then(|| (cred.header_name.as_str(), cred.header_value.as_str()))
+        .into_iter()
+        .chain(
+            cred.extra_headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+}
+
+/// Headers to strip from an inbound request: every header the route may receive
+/// the phantom token in.
+pub(crate) fn credential_strip_headers(cred: Option<&LoadedCredential>) -> &[String] {
+    cred.map_or(&[], |c| c.proxy_header_names.as_slice())
+}
+
+/// Header names the route injects, in configured case; callers compare
+/// case-insensitively.
 pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) -> Vec<String> {
     cred.filter(|c| matches!(c.inject_mode, InjectMode::Header | InjectMode::BasicAuth))
         .map(|c| {
-            let mut names = vec![c.header_name.to_lowercase()];
-            names.extend(c.extra_headers.iter().map(|(name, _)| name.to_lowercase()));
+            let mut names = vec![c.header_name.clone()];
+            names.extend(c.extra_headers.iter().map(|(name, _)| name.clone()));
             names
         })
         .unwrap_or_default()
@@ -3205,10 +3248,130 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_reverse_local_auth_accepts_the_session_token_in_either_header() {
+        let token = Zeroizing::new("session-token".to_string());
+        let path = "/v1/chat/completions";
+        for request in [
+            "Proxy-Authorization: Bearer session-token\r\n\r\n",
+            "Authorization: Bearer session-token\r\n\r\n",
+            "x-api-key: session-token\r\n\r\n",
+        ] {
+            assert!(
+                validate_reverse_local_auth(request.as_bytes(), path, &token).is_ok(),
+                "must accept {request:?}"
+            );
+        }
+        assert!(
+            validate_reverse_local_auth(
+                b"Authorization: Bearer wrong\r\nx-api-key: wrong\r\n\r\n",
+                path,
+                &token,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_validate_phantom_token_basic_rejects_bearer() {
         let token = Zeroizing::new("secret123".to_string());
         let header = b"Authorization: Bearer secret123\r\n\r\n";
         assert!(validate_phantom_token_basic(header, "Authorization", &token).is_err());
+    }
+
+    #[test]
+    fn test_validate_phantom_token_accepts_either_configured_header() {
+        let token = Zeroizing::new("secret123".to_string());
+        let names = vec!["x-api-key".to_string(), "Authorization".to_string()];
+        for header in [
+            b"x-api-key: secret123\r\n\r\n".as_slice(),
+            b"Authorization: Bearer secret123\r\n\r\n".as_slice(),
+        ] {
+            assert!(
+                validate_phantom_token_for_mode_multi(
+                    &InjectMode::Header,
+                    header,
+                    "/v1/chat/completions",
+                    &names,
+                    None,
+                    None,
+                    &token,
+                )
+                .is_ok(),
+                "phantom must be accepted in either configured header: {}",
+                String::from_utf8_lossy(header)
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_phantom_token_rejects_when_no_configured_header_matches() {
+        let token = Zeroizing::new("secret123".to_string());
+        let names = vec!["x-api-key".to_string(), "Authorization".to_string()];
+
+        let wrong_values = b"x-api-key: wrong\r\nAuthorization: Bearer wrong\r\n\r\n";
+        assert!(
+            validate_phantom_token_for_mode_multi(
+                &InjectMode::Header,
+                wrong_values,
+                "/v1/chat/completions",
+                &names,
+                None,
+                None,
+                &token,
+            )
+            .is_err()
+        );
+
+        let unrelated_header = b"Cookie: secret123\r\n\r\n";
+        assert!(
+            validate_phantom_token_for_mode_multi(
+                &InjectMode::Header,
+                unrelated_header,
+                "/v1/chat/completions",
+                &names,
+                None,
+                None,
+                &token,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_multi_strips_every_credential_header() {
+        let header = b"x-api-key: phantom\r\nAuthorization: Bearer phantom\r\nContent-Type: application/json\r\n\r\n";
+        let filtered = filter_headers_multi(header, &["x-api-key", "Authorization"]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "Content-Type");
+    }
+
+    #[test]
+    fn test_inject_credential_writes_every_header() {
+        let cred = LoadedCredential {
+            inject_mode: InjectMode::Header,
+            proxy_inject_mode: InjectMode::Header,
+            raw_credential: Zeroizing::new("real-key".to_string()),
+            header_name: "x-api-key".to_string(),
+            proxy_header_names: vec!["x-api-key".to_string(), "Authorization".to_string()],
+            header_value: Zeroizing::new("real-key".to_string()),
+            extra_headers: vec![(
+                "Authorization".to_string(),
+                Zeroizing::new("Bearer real-key".to_string()),
+            )],
+            path_pattern: None,
+            proxy_path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy_query_param_name: None,
+        };
+        let mut request = Zeroizing::new("GET /v1/chat/completions HTTP/1.1\r\n".to_string());
+        inject_credential_for_mode(&cred, &mut request);
+        assert!(request.contains("x-api-key: real-key\r\n"));
+        assert!(request.contains("Authorization: Bearer real-key\r\n"));
+        assert_eq!(
+            injected_credential_header_names(Some(&cred)),
+            vec!["x-api-key".to_string(), "Authorization".to_string()]
+        );
     }
 
     #[test]
@@ -3243,7 +3406,7 @@ mod tests {
             proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new(String::new()),
             header_name: "Authorization".to_string(),
-            proxy_header_name: "Authorization".to_string(),
+            proxy_header_names: vec!["Authorization".to_string()],
             header_value: Zeroizing::new("Bearer real".to_string()),
             extra_headers: vec![(
                 "X-Gateway-Key".to_string(),
@@ -3259,7 +3422,7 @@ mod tests {
         let names = injected_credential_header_names(Some(&cred));
         assert_eq!(
             names,
-            vec!["authorization".to_string(), "x-gateway-key".to_string()]
+            vec!["Authorization".to_string(), "X-Gateway-Key".to_string()]
         );
     }
 
@@ -3274,7 +3437,7 @@ mod tests {
             proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new(String::new()),
             header_name: "Authorization".to_string(),
-            proxy_header_name: "Authorization".to_string(),
+            proxy_header_names: vec!["Authorization".to_string()],
             header_value: Zeroizing::new("Bearer real".to_string()),
             extra_headers: vec![(
                 "X-Gateway-Key".to_string(),
@@ -3316,7 +3479,7 @@ mod tests {
             proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new(String::new()),
             header_name: "Authorization".to_string(),
-            proxy_header_name: "Authorization".to_string(),
+            proxy_header_names: vec!["Authorization".to_string()],
             header_value: Zeroizing::new(String::new()),
             extra_headers: vec![(
                 "X-Gateway-Key".to_string(),

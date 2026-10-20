@@ -37,12 +37,13 @@ pub struct LoadedCredential {
     // --- Header mode ---
     /// Header name to inject (e.g., "Authorization")
     pub header_name: String,
-    /// Header name used for proxy-side phantom token validation.
-    pub proxy_header_name: String,
+    /// Headers that may carry the phantom token; the first entry is the primary
+    /// outbound header.
+    pub proxy_header_names: Vec<String>,
     /// Formatted header value (e.g., "Bearer sk-...")
     pub header_value: Zeroizing<String>,
-    /// Additional fully materialized headers returned by a command-backed
-    /// capture. Values are redacted by the type and never audited.
+    /// Extra headers from `inject_headers` or a command-backed capture. Their
+    /// values never appear in audit records.
     pub extra_headers: Vec<(String, Zeroizing<String>)>,
 
     // --- URL path mode ---
@@ -68,9 +69,10 @@ pub struct CmdCredentialRoute {
     pub credential_name: String,
     pub inject_mode: InjectMode,
     pub proxy_inject_mode: InjectMode,
-    pub header_name: String,
-    pub proxy_header_name: String,
-    pub credential_format: Option<String>,
+    /// Outbound header specs `(name, format template)`, primary first.
+    pub header_specs: Vec<(String, String)>,
+    /// Headers that may carry the phantom token, in configured order.
+    pub proxy_header_names: Vec<String>,
     pub path_pattern: Option<String>,
     pub proxy_path_pattern: Option<String>,
     pub path_replacement: Option<String>,
@@ -78,27 +80,75 @@ pub struct CmdCredentialRoute {
     pub proxy_query_param_name: Option<String>,
 }
 
+struct MaterializedHeaders {
+    header_name: String,
+    header_value: Zeroizing<String>,
+    extra_headers: Vec<(String, Zeroizing<String>)>,
+}
+
+/// Name the route always injects, taken from the first spec.
+/// `RouteConfig::resolved_header_specs` never returns an empty list.
+fn primary_header_name(specs: &[(String, String)]) -> String {
+    specs
+        .first()
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default()
+}
+
+/// Format one secret into every outbound header spec: the first becomes the
+/// primary header, the rest go to `extra_headers` so every forwarding path
+/// injects and strips them together.
+fn materialize_headers(
+    inject_mode: &InjectMode,
+    specs: &[(String, String)],
+    secret: &str,
+) -> MaterializedHeaders {
+    match inject_mode {
+        InjectMode::Header => {
+            let mut values = specs
+                .iter()
+                .map(|(name, format)| (name.clone(), Zeroizing::new(format.replace("{}", secret))));
+            let (header_name, header_value) = values
+                .next()
+                .unwrap_or_else(|| (primary_header_name(specs), Zeroizing::new(String::new())));
+            MaterializedHeaders {
+                header_name,
+                header_value,
+                extra_headers: values.collect(),
+            }
+        }
+        InjectMode::BasicAuth => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+            MaterializedHeaders {
+                header_name: primary_header_name(specs),
+                header_value: Zeroizing::new(format!("Basic {}", encoded)),
+                extra_headers: Vec::new(),
+            }
+        }
+        InjectMode::UrlPath | InjectMode::QueryParam => MaterializedHeaders {
+            header_name: primary_header_name(specs),
+            header_value: Zeroizing::new(String::new()),
+            extra_headers: Vec::new(),
+        },
+    }
+}
+
 impl CmdCredentialRoute {
     pub fn materialize(&self, material: CredentialCaptureMaterial) -> LoadedCredential {
-        let effective_format = crate::config::resolved_credential_format(
-            self.header_name.as_str(),
-            self.credential_format.as_deref(),
-        );
-        let (raw_credential, header_value, extra_headers) = match material {
+        let (raw_credential, header_name, header_value, extra_headers) = match material {
             CredentialCaptureMaterial::Secret(secret) => {
-                let header_value = match self.inject_mode {
-                    InjectMode::Header => Zeroizing::new(effective_format.replace("{}", &secret)),
-                    InjectMode::BasicAuth => {
-                        let encoded =
-                            base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
-                        Zeroizing::new(format!("Basic {}", encoded))
-                    }
-                    InjectMode::UrlPath | InjectMode::QueryParam => Zeroizing::new(String::new()),
-                };
-                (secret, header_value, Vec::new())
+                let materialized =
+                    materialize_headers(&self.inject_mode, &self.header_specs, &secret);
+                (
+                    secret,
+                    materialized.header_name,
+                    materialized.header_value,
+                    materialized.extra_headers,
+                )
             }
             CredentialCaptureMaterial::Headers(headers) => (
                 Zeroizing::new(String::new()),
+                primary_header_name(&self.header_specs),
                 Zeroizing::new(String::new()),
                 headers,
             ),
@@ -108,8 +158,8 @@ impl CmdCredentialRoute {
             inject_mode: self.inject_mode.clone(),
             proxy_inject_mode: self.proxy_inject_mode.clone(),
             raw_credential,
-            header_name: self.header_name.clone(),
-            proxy_header_name: self.proxy_header_name.clone(),
+            header_name,
+            proxy_header_names: self.proxy_header_names.clone(),
             header_value,
             extra_headers,
             path_pattern: self.path_pattern.clone(),
@@ -130,7 +180,7 @@ impl std::fmt::Debug for LoadedCredential {
             .field("proxy_inject_mode", &self.proxy_inject_mode)
             .field("raw_credential", &"[REDACTED]")
             .field("header_name", &self.header_name)
-            .field("proxy_header_name", &self.proxy_header_name)
+            .field("proxy_header_names", &self.proxy_header_names)
             .field("header_value", &"[REDACTED]")
             .field(
                 "extra_headers",
@@ -244,31 +294,14 @@ impl CredentialStore {
                         CmdCredentialRoute {
                             credential_name,
                             inject_mode: route.inject_mode.clone(),
-                            proxy_inject_mode: route
-                                .proxy
-                                .as_ref()
-                                .and_then(|p| p.inject_mode.clone())
-                                .unwrap_or_else(|| route.inject_mode.clone()),
-                            header_name: route.inject_header.clone(),
-                            proxy_header_name: route
-                                .proxy
-                                .as_ref()
-                                .and_then(|p| p.inject_header.clone())
-                                .unwrap_or_else(|| route.inject_header.clone()),
-                            credential_format: route.credential_format.clone(),
+                            proxy_inject_mode: route.proxy_inject_mode(),
+                            header_specs: route.resolved_header_specs(),
+                            proxy_header_names: route.phantom_header_names(),
                             path_pattern: route.path_pattern.clone(),
-                            proxy_path_pattern: route
-                                .proxy
-                                .as_ref()
-                                .and_then(|p| p.path_pattern.clone())
-                                .or_else(|| route.path_pattern.clone()),
+                            proxy_path_pattern: route.proxy_path_pattern(),
                             path_replacement: route.path_replacement.clone(),
                             query_param_name: route.query_param_name.clone(),
-                            proxy_query_param_name: route
-                                .proxy
-                                .as_ref()
-                                .and_then(|p| p.query_param_name.clone())
-                                .or_else(|| route.query_param_name.clone()),
+                            proxy_query_param_name: route.proxy_query_param_name(),
                         },
                     );
                     continue;
@@ -316,54 +349,27 @@ impl CredentialStore {
                         Err(e) => return Err(ProxyError::Credential(e.to_string())),
                     };
 
-                let effective_format = crate::config::resolved_credential_format(
-                    route.inject_header.as_str(),
-                    route.credential_format.as_deref(),
+                let materialized = materialize_headers(
+                    &route.inject_mode,
+                    &route.resolved_header_specs(),
+                    &secret,
                 );
-
-                let header_value = match route.inject_mode {
-                    InjectMode::Header => Zeroizing::new(effective_format.replace("{}", &secret)),
-                    InjectMode::BasicAuth => {
-                        // Base64 encode the credential for Basic auth
-                        let encoded =
-                            base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
-                        Zeroizing::new(format!("Basic {}", encoded))
-                    }
-                    // For url_path and query_param, header_value is not used
-                    InjectMode::UrlPath | InjectMode::QueryParam => Zeroizing::new(String::new()),
-                };
 
                 credentials.insert(
                     normalized_prefix.clone(),
                     LoadedCredential {
                         inject_mode: route.inject_mode.clone(),
-                        proxy_inject_mode: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.inject_mode.clone())
-                            .unwrap_or_else(|| route.inject_mode.clone()),
+                        proxy_inject_mode: route.proxy_inject_mode(),
                         raw_credential: secret,
-                        header_name: route.inject_header.clone(),
-                        proxy_header_name: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.inject_header.clone())
-                            .unwrap_or_else(|| route.inject_header.clone()),
-                        header_value,
-                        extra_headers: Vec::new(),
+                        header_name: materialized.header_name,
+                        proxy_header_names: route.phantom_header_names(),
+                        header_value: materialized.header_value,
+                        extra_headers: materialized.extra_headers,
                         path_pattern: route.path_pattern.clone(),
-                        proxy_path_pattern: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.path_pattern.clone())
-                            .or_else(|| route.path_pattern.clone()),
+                        proxy_path_pattern: route.proxy_path_pattern(),
                         path_replacement: route.path_replacement.clone(),
                         query_param_name: route.query_param_name.clone(),
-                        proxy_query_param_name: route
-                            .proxy
-                            .as_ref()
-                            .and_then(|p| p.query_param_name.clone())
-                            .or_else(|| route.query_param_name.clone()),
+                        proxy_query_param_name: route.proxy_query_param_name(),
                     },
                 );
                 continue;
@@ -917,7 +923,7 @@ mod tests {
             proxy_inject_mode: InjectMode::Header,
             raw_credential: Zeroizing::new("sk-secret-12345".to_string()),
             header_name: "Authorization".to_string(),
-            proxy_header_name: "Authorization".to_string(),
+            proxy_header_names: vec!["Authorization".to_string()],
             header_value: Zeroizing::new("Bearer sk-secret-12345".to_string()),
             extra_headers: Vec::new(),
             path_pattern: None,
@@ -958,6 +964,7 @@ mod tests {
 
         RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: prefix.to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
@@ -994,6 +1001,7 @@ mod tests {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "preview-missing".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_MISSING_CRED".to_string()),
@@ -1113,10 +1121,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_multi_header_route_materializes_every_header() {
+        let _env = {
+            let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
+            EnvVarGuard::set_all(&[("NONO_PROXY_TEST_MULTI_TOKEN", "sk-real")])
+        };
+        let tls = test_tls_connector();
+        let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
+            inject_headers: Some(vec![
+                crate::config::HeaderInjectionConfig {
+                    header: "x-api-key".to_string(),
+                    format: Some("{}".to_string()),
+                },
+                crate::config::HeaderInjectionConfig {
+                    header: "Authorization".to_string(),
+                    format: Some("Bearer {}".to_string()),
+                },
+            ]),
+            prefix: "multi".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://NONO_PROXY_TEST_MULTI_TOKEN".to_string()),
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            upgrades: vec![],
+            rate_limit: None,
+        }];
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None)
+            .await
+            .expect("load");
+        let cred = outcome.store.get("multi").expect("credential loaded");
+
+        assert_eq!(cred.header_name, "Authorization");
+        assert_eq!(cred.header_value.as_str(), "Bearer sk-real");
+        assert_eq!(cred.extra_headers.len(), 1);
+        assert_eq!(cred.extra_headers[0].0, "x-api-key");
+        assert_eq!(cred.extra_headers[0].1.as_str(), "sk-real");
+        assert_eq!(
+            cred.proxy_header_names,
+            vec!["Authorization".to_string(), "x-api-key".to_string()]
+        );
+
+        let debug_output = format!("{cred:?}");
+        assert!(!debug_output.contains("sk-real"));
+        assert!(debug_output.contains("Authorization"));
+    }
+
+    #[tokio::test]
     async fn test_load_no_credential_routes() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "/test".to_string(),
             upstream: "https://example.com".to_string(),
             credential_key: None,
@@ -1162,6 +1232,7 @@ mod tests {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "/github".to_string(),
             upstream: "https://api.github.com".to_string(),
             credential_key: Some("cmd://github".to_string()),
@@ -1269,6 +1340,7 @@ mod tests {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "litellm".to_string(),
             upstream: "https://litellm".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_LITELLM_TOKEN".to_string()),
@@ -1309,6 +1381,7 @@ mod tests {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_API_KEY".to_string()),
@@ -1353,6 +1426,7 @@ mod tests {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "my-api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,

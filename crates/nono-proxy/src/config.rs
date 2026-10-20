@@ -772,6 +772,16 @@ pub struct RouteConfig {
     #[serde(default)]
     pub credential_format: Option<String>,
 
+    /// Inject the same credential into extra headers, each with its own value
+    /// template. Requires header mode and a static `credential_key`.
+    ///
+    /// `inject_header` / `credential_format` still inject the primary header
+    /// (default `Authorization: Bearer {}`); an entry naming it overrides its
+    /// template instead of duplicating it. The phantom is accepted in every
+    /// injected header unless `proxy.inject_header` narrows it to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_headers: Option<Vec<HeaderInjectionConfig>>,
+
     // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
     /// Example: "/bot{}/" matches "/bot<token>/getMe"
@@ -888,6 +898,224 @@ pub struct RouteConfig {
     /// stream and cannot count individual requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RouteRateLimitConfig>,
+}
+
+/// One outbound header populated from the route credential. Listing several
+/// lets one route serve clients that mix auth dialects (`x-api-key` on one
+/// lane, `Authorization: Bearer` on another).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderInjectionConfig {
+    /// HTTP header name. Must be a valid RFC 7230 token.
+    pub header: String,
+
+    /// Value template; `{}` is replaced by the secret. Defaults by header name:
+    /// `Bearer {}` for `Authorization`, `{}` otherwise.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+impl RouteConfig {
+    /// Proxy-side injection mode for phantom validation, defaulting to the
+    /// route's own mode.
+    #[must_use]
+    pub fn proxy_inject_mode(&self) -> InjectMode {
+        self.proxy
+            .as_ref()
+            .and_then(|proxy| proxy.inject_mode.clone())
+            .unwrap_or_else(|| self.inject_mode.clone())
+    }
+
+    /// Phantom path pattern, defaulting to the route's own.
+    #[must_use]
+    pub fn proxy_path_pattern(&self) -> Option<String> {
+        self.proxy
+            .as_ref()
+            .and_then(|proxy| proxy.path_pattern.clone())
+            .or_else(|| self.path_pattern.clone())
+    }
+
+    /// Phantom query parameter name, defaulting to the route's own.
+    #[must_use]
+    pub fn proxy_query_param_name(&self) -> Option<String> {
+        self.proxy
+            .as_ref()
+            .and_then(|proxy| proxy.query_param_name.clone())
+            .or_else(|| self.query_param_name.clone())
+    }
+
+    /// Effective outbound header specs as `(header, format template)`, primary
+    /// first; always at least one entry. The primary header is always injected,
+    /// and an entry naming it overrides its template rather than duplicating
+    /// it.
+    #[must_use]
+    pub fn resolved_header_specs(&self) -> Vec<(String, String)> {
+        let mut specs = vec![(
+            self.inject_header.clone(),
+            resolved_credential_format(&self.inject_header, self.credential_format.as_deref()),
+        )];
+        if matches!(self.inject_mode, InjectMode::Header)
+            && let Some(headers) = self.inject_headers.as_deref()
+            && !headers.is_empty()
+        {
+            for entry in headers {
+                let format = resolved_credential_format(&entry.header, entry.format.as_deref());
+                match specs
+                    .iter_mut()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&entry.header))
+                {
+                    Some((_, existing)) => *existing = format,
+                    None => specs.push((entry.header.clone(), format)),
+                }
+            }
+        }
+        specs
+    }
+
+    /// Headers the sandboxed client may present its phantom token in: every
+    /// injected header, so a client using a different auth dialect per lane
+    /// still authenticates. `proxy.inject_header`, validated at load to be
+    /// injected, narrows validation to that header.
+    #[must_use]
+    pub fn phantom_header_names(&self) -> Vec<String> {
+        if let Some(header) = self
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.inject_header.as_deref())
+        {
+            return vec![header.to_string()];
+        }
+        // `resolved_header_specs` already merges names case-insensitively.
+        self.resolved_header_specs()
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+}
+
+/// Validate multi-header injection configuration on one route: rejects
+/// constructs the runtime cannot honor, so a header list is never half-applied.
+pub fn validate_header_injection(prefix: &str, route: &RouteConfig) -> crate::error::Result<()> {
+    let Some(headers) = route.inject_headers.as_deref() else {
+        return Ok(());
+    };
+    if headers.is_empty() {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `inject_headers` must not be empty; omit it to use `inject_header`"
+        )));
+    }
+    if !matches!(route.inject_mode, InjectMode::Header) {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `inject_headers` is only supported with inject_mode \"header\""
+        )));
+    }
+    if route.credential_key.is_none() {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `inject_headers` requires a static `credential_key`"
+        )));
+    }
+    if route.oauth2.is_some() || route.aws_auth.is_some() || route.spiffe.is_some() {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `inject_headers` cannot be combined with `oauth2`, `aws_auth`, \
+             or `spiffe`"
+        )));
+    }
+
+    // Fail secure: h2/TLS-intercept forwarding strips only outbound header
+    // names, so narrowing to a header the route never injects leaks the
+    // client's phantom copy upstream.
+    if let Some(proxy_header) = route
+        .proxy
+        .as_ref()
+        .and_then(|p| p.inject_header.as_deref())
+        .filter(|proxy_header| {
+            !route.inject_header.eq_ignore_ascii_case(proxy_header)
+                && !headers
+                    .iter()
+                    .any(|entry| entry.header.eq_ignore_ascii_case(proxy_header))
+        })
+    {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `proxy.inject_header` '{proxy_header}' is neither the \
+             `inject_header` nor one of the `inject_headers` entries, so it would never be \
+             stripped and the phantom token would leak"
+        )));
+    }
+
+    // The primary header is injected too, so it is a valid target.
+    if !is_http_header_token(&route.inject_header) {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `inject_header` '{}' is not a valid HTTP header name",
+            route.inject_header
+        )));
+    }
+    if is_forbidden_injected_header(&route.inject_header) {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `inject_header` cannot be hop-by-hop or authority-changing \
+             header '{}'",
+            route.inject_header
+        )));
+    }
+    let primary_format =
+        resolved_credential_format(&route.inject_header, route.credential_format.as_deref());
+    if primary_format.contains('\r') || primary_format.contains('\n') {
+        return Err(crate::error::ProxyError::Config(format!(
+            "route '{prefix}': `credential_format` for '{}' contains CR/LF",
+            route.inject_header
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for entry in headers {
+        if !is_http_header_token(&entry.header) {
+            return Err(crate::error::ProxyError::Config(format!(
+                "route '{prefix}': `inject_headers` entry '{}' is not a valid HTTP header name",
+                entry.header
+            )));
+        }
+        if is_forbidden_injected_header(&entry.header) {
+            return Err(crate::error::ProxyError::Config(format!(
+                "route '{prefix}': `inject_headers` cannot set hop-by-hop or \
+                 authority-changing header '{}'",
+                entry.header
+            )));
+        }
+        if !seen.insert(entry.header.to_ascii_lowercase()) {
+            return Err(crate::error::ProxyError::Config(format!(
+                "route '{prefix}': `inject_headers` lists header '{}' more than once",
+                entry.header
+            )));
+        }
+        let format = resolved_credential_format(&entry.header, entry.format.as_deref());
+        if format.contains('\r') || format.contains('\n') {
+            return Err(crate::error::ProxyError::Config(format!(
+                "route '{prefix}': `inject_headers` format for '{}' contains CR/LF",
+                entry.header
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Headers a credential must never be injected into: they frame the request or
+/// select the upstream authority, so a value there changes meaning rather than
+/// authenticating the request.
+#[must_use]
+pub fn is_forbidden_injected_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+    )
 }
 
 /// A WebSocket path allow-listed on one concrete upstream route.
@@ -2460,6 +2688,226 @@ mod tests {
             resolved_credential_format(&route.inject_header, route.credential_format.as_deref()),
             "Bearer {}"
         );
+    }
+
+    #[test]
+    fn test_route_inject_headers_resolve_order_and_default_formats() {
+        // Only the extra headers are listed. `inject_header` supplies
+        // Authorization, and each format defaults by header name.
+        let json = r#"{
+            "prefix": "my_api",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://MY_API_KEY",
+            "inject_headers": [
+                { "header": "x-api-key", "format": "{}" },
+                { "header": "x-session-token" }
+            ]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            route.resolved_header_specs(),
+            vec![
+                ("Authorization".to_string(), "Bearer {}".to_string()),
+                ("x-api-key".to_string(), "{}".to_string()),
+                ("x-session-token".to_string(), "{}".to_string()),
+            ]
+        );
+        assert_eq!(
+            route.phantom_header_names(),
+            vec![
+                "Authorization".to_string(),
+                "x-api-key".to_string(),
+                "x-session-token".to_string()
+            ]
+        );
+        validate_header_injection("my_api", &route).expect("valid multi-header route");
+    }
+
+    #[test]
+    fn test_route_inject_headers_are_additive_to_the_primary_header() {
+        // A route that only needs an extra header must not have to repeat
+        // Authorization: the primary header is injected alongside it.
+        let json = r#"{
+            "prefix": "additive",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://MY_API_KEY",
+            "inject_headers": [{ "header": "x-api-key", "format": "{}" }]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            route.resolved_header_specs(),
+            vec![
+                ("Authorization".to_string(), "Bearer {}".to_string()),
+                ("x-api-key".to_string(), "{}".to_string()),
+            ]
+        );
+        validate_header_injection("additive", &route).expect("additive route is valid");
+    }
+
+    #[test]
+    fn test_route_inject_headers_entry_overrides_primary_template() {
+        let json = r#"{
+            "prefix": "override",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://MY_API_KEY",
+            "credential_format": "Bearer {}",
+            "inject_headers": [{ "header": "authorization", "format": "token {}" }]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            route.resolved_header_specs(),
+            vec![("Authorization".to_string(), "token {}".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_route_primary_header_can_be_the_only_injected_header() {
+        // Setting inject_header explicitly keeps Authorization out, matching
+        // the scalar contract a route had before it listed extras.
+        let json = r#"{
+            "prefix": "scalar",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://MY_API_KEY",
+            "inject_header": "x-api-key",
+            "credential_format": "{}"
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            route.resolved_header_specs(),
+            vec![("x-api-key".to_string(), "{}".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_route_inject_headers_rejects_duplicate_names_case_insensitively() {
+        let json = r#"{
+            "prefix": "dup",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [
+                { "header": "x-api-key", "format": "{}" },
+                { "header": "X-Api-Key", "format": "{}" }
+            ]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let err = validate_header_injection("dup", &route).expect_err("duplicate must be rejected");
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn test_route_inject_headers_rejects_empty_header_name() {
+        let json = r#"{
+            "prefix": "empty",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [{ "header": "", "format": "{}" }]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let err = validate_header_injection("empty", &route).expect_err("empty name must fail");
+        assert!(
+            err.to_string().contains("not a valid HTTP header name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_route_inject_headers_rejects_non_header_mode() {
+        let json = r#"{
+            "prefix": "q",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_mode": "query_param",
+            "query_param_name": "key",
+            "inject_headers": [{ "header": "x-api-key", "format": "{}" }]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let err = validate_header_injection("q", &route).expect_err("mode must be rejected");
+        assert!(err.to_string().contains("inject_mode"), "{err}");
+    }
+
+    #[test]
+    fn test_route_inject_headers_rejects_crlf_format() {
+        let json = r#"{
+            "prefix": "crlf",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [{ "header": "x-api-key", "format": "a\r\nX-Injected: b" }]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let err = validate_header_injection("crlf", &route).expect_err("CRLF must be rejected");
+        assert!(err.to_string().contains("CR/LF"), "{err}");
+    }
+
+    #[test]
+    fn test_route_inject_headers_rejects_hop_by_hop_header() {
+        let json = r#"{
+            "prefix": "host",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [{ "header": "Host", "format": "{}" }]
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let err = validate_header_injection("host", &route).expect_err("Host must be rejected");
+        assert!(err.to_string().contains("hop-by-hop"), "{err}");
+    }
+
+    #[test]
+    fn test_route_inject_headers_rejects_phantom_override_outside_header_list() {
+        // The primary header is injected too, so narrowing to it is valid even
+        // when only the extra header is listed.
+        let json = r#"{
+            "prefix": "narrow",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [{ "header": "x-api-key", "format": "{}" }],
+            "proxy": { "inject_header": "Authorization" }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        validate_header_injection("narrow", &route)
+            .expect("primary header is injected, so it may accept the phantom");
+
+        let json_uninjected = r#"{
+            "prefix": "narrow",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [{ "header": "x-api-key", "format": "{}" }],
+            "proxy": { "inject_header": "x-custom-auth" }
+        }"#;
+        let route_uninjected: RouteConfig = serde_json::from_str(json_uninjected).unwrap();
+        let err = validate_header_injection("narrow", &route_uninjected)
+            .expect_err("a header the route never injects must be rejected");
+        assert!(
+            err.to_string()
+                .contains("is neither the `inject_header` nor one of the"),
+            "{err}"
+        );
+
+        let json_ci = r#"{
+            "prefix": "narrow",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [{ "header": "X-Api-Key", "format": "{}" }],
+            "proxy": { "inject_header": "x-api-key" }
+        }"#;
+        let route_ci: RouteConfig = serde_json::from_str(json_ci).unwrap();
+        validate_header_injection("narrow", &route_ci).expect("case-insensitive match accepted");
+    }
+
+    #[test]
+    fn test_route_phantom_header_override_narrows_inbound_location() {
+        let json = r#"{
+            "prefix": "multi",
+            "upstream": "https://api.example.com",
+            "credential_key": "env://TOKEN",
+            "inject_headers": [
+                { "header": "x-api-key", "format": "{}" },
+                { "header": "x-session-token", "format": "{}" }
+            ],
+            "proxy": { "inject_header": "x-api-key" }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(route.phantom_header_names(), vec!["x-api-key".to_string()]);
+        assert_eq!(route.resolved_header_specs().len(), 3);
     }
 
     #[test]

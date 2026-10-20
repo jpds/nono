@@ -2647,6 +2647,7 @@ mod tests {
     async fn normalize_authority_matches_ipv6_route_upstreams() -> Result<()> {
         let routes = vec![crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "local".to_string(),
             upstream: "http://[::1]:8080/v1".to_string(),
             credential_key: Some("local".to_string()),
@@ -2826,6 +2827,7 @@ mod tests {
     fn declarative_route(upstream: &str) -> crate::config::RouteConfig {
         crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: "svc".to_string(),
             upstream: upstream.to_string(),
             credential_key: None,
@@ -3482,6 +3484,7 @@ mod tests {
             let config = ProxyConfig {
                 routes: vec![crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -3562,6 +3565,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "alias".to_string(),
                 upstream: "https://aliased.example.com".to_string(),
                 credential_key: None,
@@ -3652,6 +3656,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -3704,6 +3709,7 @@ mod tests {
             routes: vec![
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3728,6 +3734,7 @@ mod tests {
                 },
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "alias".to_string(),
                     upstream: "https://aliased.example.com".to_string(),
                     credential_key: None,
@@ -3792,6 +3799,7 @@ mod tests {
                 // Credential catch-all route (no endpoint rules).
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "github_api".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3817,6 +3825,7 @@ mod tests {
                 // Synthetic endpoint-authorization route for the same upstream.
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "_ep_api.github.com".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: None,
@@ -3881,6 +3890,7 @@ mod tests {
                 // Wildcard credential route.
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "github_raw".to_string(),
                     upstream: "https://*.githubusercontent.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3906,6 +3916,7 @@ mod tests {
                 // `_ep_` route on a concrete subdomain covered by the wildcard.
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "_ep_raw.githubusercontent.com".to_string(),
                     upstream: "https://raw.githubusercontent.com".to_string(),
                     credential_key: None,
@@ -3959,6 +3970,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -4008,6 +4020,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
             redeem_phantoms: Vec::new(),
+            inject_headers: None,
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -4127,6 +4140,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -4184,6 +4198,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("openai_api_key".to_string()),
@@ -4250,6 +4265,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("op://Development/OpenAI/credential".to_string()),
@@ -4322,6 +4338,7 @@ mod tests {
             routes: vec![
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("openai_api_key".to_string()),
@@ -4346,6 +4363,7 @@ mod tests {
                 },
                 crate::config::RouteConfig {
                     redeem_phantoms: Vec::new(),
+                    inject_headers: None,
                     prefix: "github".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://GITHUB_TOKEN".to_string()),
@@ -4414,6 +4432,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "myapi".to_string(),
                 upstream: "https://api.internal.corp".to_string(),
                 credential_key: None,
@@ -4480,6 +4499,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "/anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -4520,6 +4540,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai/".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -4583,6 +4604,7 @@ mod tests {
         let config_no_env_var = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -4635,6 +4657,7 @@ mod tests {
         let config_fixed = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: Some("ANTHROPIC_API_KEY".to_string()),
@@ -4915,6 +4938,7 @@ mod tests {
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -4962,6 +4986,7 @@ mod tests {
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -5033,6 +5058,7 @@ mod tests {
             ],
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -5074,6 +5100,7 @@ mod tests {
             ],
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "local".to_string(),
                 upstream: "http://[::1]:8080/v1".to_string(),
                 credential_key: Some("local".to_string()),
@@ -5117,6 +5144,7 @@ mod tests {
             ],
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "internal".to_string(),
                 upstream: "https://*.dev.example.net".to_string(),
                 credential_key: Some("internal".to_string()),
@@ -5317,6 +5345,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -6246,6 +6275,7 @@ mod tests {
             allowed_hosts: vec!["127.0.0.1".to_string()],
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "svc".to_string(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -6356,6 +6386,7 @@ mod tests {
                 spiffe: None,
                 rate_limit: None,
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 upgrades: vec![],
             }],
             ..ProxyConfig::default()
@@ -6455,6 +6486,7 @@ mod tests {
                 spiffe: None,
                 rate_limit: None,
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 upgrades: vec![],
             }],
             ..ProxyConfig::default()
@@ -6642,6 +6674,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
                 redeem_phantoms: Vec::new(),
+                inject_headers: None,
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
