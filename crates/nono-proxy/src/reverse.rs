@@ -1918,6 +1918,60 @@ fn validate_phantom_token(
     )
 }
 
+/// Strip a case-insensitive `Bearer ` prefix, mirroring phantom validation.
+/// Byte comparison keeps offsets on a `str` boundary.
+fn phantom_token_value(value: &str) -> &str {
+    if value.len() >= 7 && value.as_bytes()[..7].eq_ignore_ascii_case(b"bearer ") {
+        value[7..].trim()
+    } else {
+        value
+    }
+}
+
+/// Whether `value` presents the proxy session token, with or without a
+/// `Bearer ` prefix.
+#[must_use]
+pub(crate) fn value_presents_phantom_token(value: &str, session_token: &Zeroizing<String>) -> bool {
+    token::constant_time_eq(
+        phantom_token_value(value.trim()).as_bytes(),
+        session_token.as_bytes(),
+    )
+}
+
+/// Header names whose value presents `session_token`, in wire order. Names
+/// only: the token is never returned or logged.
+fn phantom_presenting_headers(
+    header_bytes: &[u8],
+    session_token: &Zeroizing<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    for line in header_str.lines() {
+        let Some((raw_name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = raw_name.trim();
+        if name.is_empty() || !value_presents_phantom_token(raw_value.trim(), session_token) {
+            continue;
+        }
+        if !names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// `; session token presented in: <headers>` for a validation failure, empty
+/// string when the client presented no token.
+fn presented_headers_note(header_bytes: &[u8], session_token: &Zeroizing<String>) -> String {
+    let presented = phantom_presenting_headers(header_bytes, session_token);
+    if presented.is_empty() {
+        String::new()
+    } else {
+        format!("; session token presented in: {}", presented.join(", "))
+    }
+}
+
 fn validate_phantom_token_any<S: AsRef<str>>(
     header_bytes: &[u8],
     header_names: &[S],
@@ -1944,22 +1998,17 @@ fn validate_phantom_token_any<S: AsRef<str>>(
         saw_listed = true;
 
         let value = raw_value.trim();
-        // Case-insensitive check, slice the original by length.
-        let value_lower = value.to_lowercase();
-        let token_value = if value_lower.starts_with("bearer ") {
-            value[7..].trim()
-        } else {
-            value
-        };
+        let token_value = phantom_token_value(value);
 
         if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
             return Ok(());
         }
     }
 
+    let presented = presented_headers_note(header_bytes, session_token);
     if saw_listed {
         warn!(
-            "Invalid phantom token in configured credential header(s): {}",
+            "Invalid phantom token in configured credential header(s): {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -1968,7 +2017,7 @@ fn validate_phantom_token_any<S: AsRef<str>>(
         );
     } else {
         warn!(
-            "Missing phantom token header; expected one of: {}",
+            "Missing phantom token header; expected one of: {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -2031,9 +2080,10 @@ fn validate_phantom_token_basic_any<S: AsRef<str>>(
         }
     }
 
+    let presented = presented_headers_note(header_bytes, session_token);
     if saw_listed {
         warn!(
-            "Invalid or non-Basic phantom token in configured credential header(s): {}",
+            "Invalid or non-Basic phantom token in configured credential header(s): {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -2042,7 +2092,7 @@ fn validate_phantom_token_basic_any<S: AsRef<str>>(
         );
     } else {
         warn!(
-            "Missing phantom token header; expected one of: {}",
+            "Missing phantom token header; expected one of: {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -2481,8 +2531,7 @@ pub(crate) fn validate_phantom_token_for_mode(
 }
 
 /// Validate the phantom token from any of several inbound headers: a match in
-/// any listed header authorizes; an invalid value in a listed header does not
-/// authorize.
+/// any listed header authorizes, an invalid value in a listed header does not.
 pub(crate) fn validate_phantom_token_for_mode_multi<S: AsRef<str>>(
     mode: &InjectMode,
     header_bytes: &[u8],
@@ -3261,6 +3310,48 @@ mod tests {
     }
 
     #[test]
+    fn test_value_presents_phantom_token_accepts_bearer_and_bare() {
+        let token = Zeroizing::new("secret123".to_string());
+        assert!(value_presents_phantom_token("secret123", &token));
+        assert!(value_presents_phantom_token("Bearer secret123", &token));
+        assert!(value_presents_phantom_token("bEaReR secret123", &token));
+        assert!(!value_presents_phantom_token("Bearer secret1234", &token));
+        assert!(!value_presents_phantom_token("", &token));
+    }
+
+    #[test]
+    fn test_phantom_presenting_headers_names_the_header_the_client_used() {
+        let token = Zeroizing::new("secret123".to_string());
+        let headers = b"x-api-key: wrong\r\nAuthorization: Bearer secret123\r\nAccept: */*\r\n\r\n";
+        assert_eq!(
+            phantom_presenting_headers(headers, &token),
+            vec!["Authorization".to_string()]
+        );
+        assert_eq!(
+            presented_headers_note(headers, &token),
+            "; session token presented in: Authorization"
+        );
+    }
+
+    #[test]
+    fn test_phantom_presenting_headers_dedupes_case_insensitively() {
+        let token = Zeroizing::new("secret123".to_string());
+        let headers = b"authorization: Bearer secret123\r\nAUTHORIZATION: bearer secret123\r\n\r\n";
+        assert_eq!(
+            phantom_presenting_headers(headers, &token),
+            vec!["authorization".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_presented_headers_note_empty_when_no_token_presented() {
+        let token = Zeroizing::new("secret123".to_string());
+        let headers = b"Authorization: Bearer something-else\r\nx-api-key: secret99\r\n\r\n";
+        assert!(phantom_presenting_headers(headers, &token).is_empty());
+        assert!(presented_headers_note(headers, &token).is_empty());
+    }
+
+    #[test]
     fn test_validate_phantom_token_accepts_either_configured_header() {
         let token = Zeroizing::new("secret123".to_string());
         let names = vec!["x-api-key".to_string(), "Authorization".to_string()];
@@ -3272,7 +3363,7 @@ mod tests {
                 validate_phantom_token_for_mode_multi(
                     &InjectMode::Header,
                     header,
-                    "/zen/v1/models",
+                    "/v1/chat/completions",
                     &names,
                     None,
                     None,
@@ -3295,7 +3386,7 @@ mod tests {
             validate_phantom_token_for_mode_multi(
                 &InjectMode::Header,
                 wrong_values,
-                "/zen/v1/models",
+                "/v1/chat/completions",
                 &names,
                 None,
                 None,
@@ -3309,7 +3400,7 @@ mod tests {
             validate_phantom_token_for_mode_multi(
                 &InjectMode::Header,
                 unrelated_header,
-                "/zen/v1/models",
+                "/v1/chat/completions",
                 &names,
                 None,
                 None,
@@ -3346,7 +3437,7 @@ mod tests {
             query_param_name: None,
             proxy_query_param_name: None,
         };
-        let mut request = Zeroizing::new("GET /zen/v1/models HTTP/1.1\r\n".to_string());
+        let mut request = Zeroizing::new("GET /v1/chat/completions HTTP/1.1\r\n".to_string());
         inject_credential_for_mode(&cred, &mut request);
         assert!(request.contains("x-api-key: real-key\r\n"));
         assert!(request.contains("Authorization: Bearer real-key\r\n"));
