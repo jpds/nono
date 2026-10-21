@@ -224,3 +224,53 @@ async fn test_extra_headers_are_added_to_the_inject_header() {
 
     handle.shutdown();
 }
+
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // sole test in this binary: no concurrent env access
+async fn test_unlisted_header_carrying_the_phantom_is_dropped() {
+    // SAFETY: only test in this binary; no concurrent env access.
+    unsafe { std::env::set_var("NONO_PROXY_TEST_DROP_KEY", "sk-drop") };
+
+    let (upstream_port, captured, upstream) = capture_upstream(1).await;
+    let route = base_route(
+        "drop",
+        format!("http://127.0.0.1:{upstream_port}"),
+        "env://NONO_PROXY_TEST_DROP_KEY",
+    );
+
+    let handle = start_proxy(route).await;
+    let token = handle.token.as_str().to_string();
+
+    // Authorization authenticates the request; the same token in x-other is a
+    // header the route does not inject, so it must not be forwarded.
+    let request = format!(
+        "GET /drop/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {token}\r\nX-Other: {token}\r\nConnection: close\r\n\r\n",
+        handle.port
+    );
+    let response = send_request(handle.port, request).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected proxy response: {response}"
+    );
+
+    upstream.await.expect("mock upstream task");
+    let captured = captured.lock().expect("capture lock");
+    let forwarded = captured
+        .first()
+        .expect("one forwarded request")
+        .to_lowercase();
+    assert!(
+        forwarded.contains("authorization: bearer sk-drop"),
+        "authenticated header must carry the real credential: {forwarded}"
+    );
+    assert!(
+        !forwarded.contains("x-other:"),
+        "header carrying the phantom must be dropped: {forwarded}"
+    );
+    assert!(
+        !forwarded.contains(&token.to_lowercase()),
+        "phantom token must not reach the upstream: {forwarded}"
+    );
+
+    handle.shutdown();
+}

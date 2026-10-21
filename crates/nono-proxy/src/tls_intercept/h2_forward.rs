@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 /// Spawn-safe context for per-stream h2 handlers.
 ///
@@ -43,6 +44,7 @@ struct SharedH2Ctx {
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
+    session_token: Zeroizing<String>,
     /// Managed upstream auth source shared across all streams on this connection.
     /// `None` for non-SPIFFE upstreams.
     managed_auth: Option<Arc<crate::auth::ManagedUpstreamAuth>>,
@@ -134,6 +136,7 @@ where
         approval_backends: ctx.approval_backends.clone(),
         credential_capture_backend: ctx.credential_capture_backend.clone(),
         nonce_resolver: ctx.nonce_resolver.clone(),
+        session_token: ctx.session_token.clone(),
         managed_auth,
     };
 
@@ -397,7 +400,7 @@ async fn handle_h2_stream(
         }
         // Skip any header the credential will inject (primary + extra), so a
         // client-supplied copy cannot survive alongside the injected value.
-        if injected_header_names.contains(&name_lower) {
+        if crate::reverse::is_injected_header(&injected_header_names, name.as_str()) {
             continue;
         }
         // Strip the SPIFFE JWT inject header so a client-supplied copy cannot
@@ -436,7 +439,20 @@ async fn handle_h2_stream(
                 upstream_headers.insert(name.clone(), val);
             }
             None => {
-                upstream_headers.insert(name.clone(), value.clone());
+                let consumed = value.to_str().is_ok_and(|value_str| {
+                    crate::reverse::consume_unlisted_phantom(
+                        "tls_intercept",
+                        service,
+                        cred.is_some(),
+                        &injected_header_names,
+                        name.as_str(),
+                        value_str,
+                        &ctx.session_token,
+                    )
+                });
+                if !consumed {
+                    upstream_headers.insert(name.clone(), value.clone());
+                }
             }
         }
     }

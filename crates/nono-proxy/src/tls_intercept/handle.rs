@@ -1325,10 +1325,7 @@ where
     let nonce_consumer = service.map(|s| format!("proxy.{s}"));
     let redeem_phantoms: &[String] = route.map_or(&[], |r| r.redeem_phantoms.as_slice());
     for (name, value) in &filtered_headers {
-        if injected_header_names
-            .iter()
-            .any(|header| name.eq_ignore_ascii_case(header))
-        {
+        if reverse::is_injected_header(&injected_header_names, name) {
             continue;
         }
         let mut resolved_value = nonce_consumer
@@ -1390,8 +1387,24 @@ where
                 }
             }
         }
-        let resolved_value = resolved_value.unwrap_or_else(|| value.clone());
-        request.push_str(&format!("{}: {}\r\n", name, resolved_value));
+        let forwarded_value = match resolved_value {
+            Some(resolved) => resolved,
+            None => {
+                if reverse::consume_unlisted_phantom(
+                    "tls_intercept",
+                    service,
+                    cred.is_some(),
+                    &injected_header_names,
+                    name,
+                    value,
+                    ctx.session_token,
+                ) {
+                    continue;
+                }
+                value.clone()
+            }
+        };
+        request.push_str(&format!("{}: {}\r\n", name, forwarded_value));
     }
     request.push_str("Connection: close\r\n");
     if !body.is_empty() {

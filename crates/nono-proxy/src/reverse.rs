@@ -25,9 +25,11 @@ use crate::forward::{AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
 use crate::route::RouteStore;
 use crate::token;
 use base64::Engine as _;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -596,10 +598,20 @@ pub async fn handle_reverse_proxy(
 
     let injected_header_names = injected_credential_header_names(cred);
     for (name, value) in &filtered_headers {
-        if injected_header_names
-            .iter()
-            .any(|header| name.eq_ignore_ascii_case(header))
-        {
+        if is_injected_header(&injected_header_names, name) {
+            continue;
+        }
+        // A phantom in a header the route does not inject cannot authenticate,
+        // and forwarding it would hand the provider the session token.
+        if consume_unlisted_phantom(
+            "reverse",
+            Some(&service),
+            cred.is_some(),
+            &injected_header_names,
+            name,
+            value,
+            ctx.session_token,
+        ) {
             continue;
         }
         req_builder = req_builder.header(name.as_str(), value.as_str());
@@ -1942,6 +1954,142 @@ fn validate_phantom_token(
     )
 }
 
+/// Strip a case-insensitive `Bearer ` prefix, mirroring phantom validation.
+/// Byte comparison keeps offsets on a `str` boundary.
+fn phantom_token_value(value: &str) -> &str {
+    if value.len() >= 7 && value.as_bytes()[..7].eq_ignore_ascii_case(b"bearer ") {
+        value[7..].trim()
+    } else {
+        value
+    }
+}
+
+/// Whether `value` presents the proxy session token, with or without a
+/// `Bearer ` prefix.
+#[must_use]
+pub(crate) fn value_presents_phantom_token(value: &str, session_token: &Zeroizing<String>) -> bool {
+    token::constant_time_eq(
+        phantom_token_value(value.trim()).as_bytes(),
+        session_token.as_bytes(),
+    )
+}
+
+/// Header names whose value presents `session_token`, in wire order. Names
+/// only: the token is never returned or logged.
+fn phantom_presenting_headers(
+    header_bytes: &[u8],
+    session_token: &Zeroizing<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    for line in header_str.lines() {
+        let Some((raw_name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = raw_name.trim();
+        if name.is_empty() || !value_presents_phantom_token(raw_value.trim(), session_token) {
+            continue;
+        }
+        if !names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// `; session token presented in: <headers>` for a validation failure, empty
+/// string when the client presented no token.
+fn presented_headers_note(header_bytes: &[u8], session_token: &Zeroizing<String>) -> String {
+    let presented = phantom_presenting_headers(header_bytes, session_token);
+    if presented.is_empty() {
+        String::new()
+    } else {
+        format!("; session token presented in: {}", presented.join(", "))
+    }
+}
+
+/// Consume a header that presents the proxy session token in a lane the route
+/// does not inject: warns once per `(mode, route, header)` and returns `true`
+/// so the caller drops it. `mode` names the forwarding path in the warning.
+///
+/// The client was handed this token, and no provider accepts it, so forwarding
+/// it trades a silent 401 for a leaked session. Dropping it by value lets a
+/// route list only the headers its provider needs.
+pub(crate) fn consume_unlisted_phantom(
+    mode: &str,
+    service: Option<&str>,
+    injects_credential: bool,
+    injected_headers: &[String],
+    header: &str,
+    value: &str,
+    session_token: &Zeroizing<String>,
+) -> bool {
+    if !value_presents_phantom_token(value, session_token) {
+        return false;
+    }
+    if claim_phantom_warning(mode, service, header) {
+        warn!(
+            "{}",
+            unlisted_phantom_notice(mode, service, injects_credential, injected_headers, header)
+        );
+    }
+    true
+}
+
+/// Split from [`consume_unlisted_phantom`] so tests can assert the line without
+/// a log subscriber. Names headers only, never the token value, and gives no
+/// advice: only the provider knows which header it accepts.
+fn unlisted_phantom_notice(
+    mode: &str,
+    service: Option<&str>,
+    injects_credential: bool,
+    injected_headers: &[String],
+    header: &str,
+) -> String {
+    let observed =
+        format!("{mode}: dropped header '{header}' that carried the proxy session token");
+    match service {
+        None => format!("{observed}; no credential route matched this upstream"),
+        Some(route) if !injects_credential => {
+            format!("{observed}; route '{route}' injects no credential")
+        }
+        Some(route) if injected_headers.is_empty() => {
+            format!("{observed}; route '{route}' injects the credential outside request headers")
+        }
+        Some(route) => {
+            let injected = injected_headers
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{observed}; route '{route}' injects {injected}")
+        }
+    }
+}
+
+/// `true` the first time a `(mode, route, header)` triple is seen, `false`
+/// after or once the set is full.
+///
+/// Process-wide so a client polling one lane logs one line instead of one per
+/// request. The cap stops a client varying header names from growing the set
+/// without bound; past it, drops stay silent.
+fn claim_phantom_warning(mode: &str, service: Option<&str>, header: &str) -> bool {
+    const MAX_TRACKED: usize = 512;
+    static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let Ok(mut warned) = WARNED.lock() else {
+        return false;
+    };
+    let key = format!(
+        "{mode}:{}:{}",
+        service.unwrap_or("-"),
+        header.to_ascii_lowercase()
+    );
+    if warned.len() >= MAX_TRACKED && !warned.contains(&key) {
+        return false;
+    }
+    warned.insert(key)
+}
+
 fn validate_phantom_token_any<S: AsRef<str>>(
     header_bytes: &[u8],
     header_names: &[S],
@@ -1968,22 +2116,17 @@ fn validate_phantom_token_any<S: AsRef<str>>(
         saw_listed = true;
 
         let value = raw_value.trim();
-        // Case-insensitive check, slice the original by length.
-        let value_lower = value.to_lowercase();
-        let token_value = if value_lower.starts_with("bearer ") {
-            value[7..].trim()
-        } else {
-            value
-        };
+        let token_value = phantom_token_value(value);
 
         if token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes()) {
             return Ok(());
         }
     }
 
+    let presented = presented_headers_note(header_bytes, session_token);
     if saw_listed {
         warn!(
-            "Invalid phantom token in configured credential header(s): {}",
+            "Invalid phantom token in configured credential header(s): {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -1992,7 +2135,7 @@ fn validate_phantom_token_any<S: AsRef<str>>(
         );
     } else {
         warn!(
-            "Missing phantom token header; expected one of: {}",
+            "Missing phantom token header; expected one of: {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -2055,9 +2198,10 @@ fn validate_phantom_token_basic_any<S: AsRef<str>>(
         }
     }
 
+    let presented = presented_headers_note(header_bytes, session_token);
     if saw_listed {
         warn!(
-            "Invalid or non-Basic phantom token in configured credential header(s): {}",
+            "Invalid or non-Basic phantom token in configured credential header(s): {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -2066,7 +2210,7 @@ fn validate_phantom_token_basic_any<S: AsRef<str>>(
         );
     } else {
         warn!(
-            "Missing phantom token header; expected one of: {}",
+            "Missing phantom token header; expected one of: {}{presented}",
             header_names
                 .iter()
                 .map(AsRef::as_ref)
@@ -2936,6 +3080,14 @@ pub(crate) fn credential_strip_headers(cred: Option<&LoadedCredential>) -> &[Str
     cred.map_or(&[], |c| c.proxy_header_names.as_slice())
 }
 
+/// Whether `name` is a header the route injects, so an inbound copy must be
+/// dropped before the real value is added.
+pub(crate) fn is_injected_header(injected_names: &[String], name: &str) -> bool {
+    injected_names
+        .iter()
+        .any(|injected| injected.eq_ignore_ascii_case(name))
+}
+
 /// Header names the route injects, in configured case; callers compare
 /// case-insensitively.
 pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) -> Vec<String> {
@@ -3276,6 +3428,145 @@ mod tests {
         let token = Zeroizing::new("secret123".to_string());
         let header = b"Authorization: Bearer secret123\r\n\r\n";
         assert!(validate_phantom_token_basic(header, "Authorization", &token).is_err());
+    }
+
+    #[test]
+    fn test_value_presents_phantom_token_accepts_bearer_and_bare() {
+        let token = Zeroizing::new("secret123".to_string());
+        assert!(value_presents_phantom_token("secret123", &token));
+        assert!(value_presents_phantom_token("Bearer secret123", &token));
+        assert!(value_presents_phantom_token("bEaReR secret123", &token));
+        assert!(!value_presents_phantom_token("Bearer secret1234", &token));
+        assert!(!value_presents_phantom_token("", &token));
+    }
+
+    #[test]
+    fn test_phantom_presenting_headers_names_the_header_the_client_used() {
+        let token = Zeroizing::new("secret123".to_string());
+        let headers = b"x-api-key: wrong\r\nAuthorization: Bearer secret123\r\nAccept: */*\r\n\r\n";
+        assert_eq!(
+            phantom_presenting_headers(headers, &token),
+            vec!["Authorization".to_string()]
+        );
+        assert_eq!(
+            presented_headers_note(headers, &token),
+            "; session token presented in: Authorization"
+        );
+    }
+
+    #[test]
+    fn test_phantom_presenting_headers_dedupes_case_insensitively() {
+        let token = Zeroizing::new("secret123".to_string());
+        let headers = b"authorization: Bearer secret123\r\nAUTHORIZATION: bearer secret123\r\n\r\n";
+        assert_eq!(
+            phantom_presenting_headers(headers, &token),
+            vec!["authorization".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_presented_headers_note_empty_when_no_token_presented() {
+        let token = Zeroizing::new("secret123".to_string());
+        let headers = b"Authorization: Bearer something-else\r\nx-api-key: secret99\r\n\r\n";
+        assert!(phantom_presenting_headers(headers, &token).is_empty());
+        assert!(presented_headers_note(headers, &token).is_empty());
+    }
+
+    #[test]
+    fn unlisted_phantom_notice_names_header_and_injected_headers() {
+        let injected = vec!["x-api-key".to_string()];
+        assert_eq!(
+            unlisted_phantom_notice("reverse", Some("my-api"), true, &injected, "Authorization"),
+            "reverse: dropped header 'Authorization' that carried the proxy session \
+             token; route 'my-api' injects 'x-api-key'"
+        );
+    }
+
+    #[test]
+    fn unlisted_phantom_notice_reports_missing_route_or_credential() {
+        assert_eq!(
+            unlisted_phantom_notice("tls_intercept", None, false, &[], "authorization"),
+            "tls_intercept: dropped header 'authorization' that carried the proxy session \
+             token; no credential route matched this upstream"
+        );
+        assert_eq!(
+            unlisted_phantom_notice("tls_intercept", Some("my-api"), false, &[], "authorization"),
+            "tls_intercept: dropped header 'authorization' that carried the proxy session \
+             token; route 'my-api' injects no credential"
+        );
+        assert_eq!(
+            unlisted_phantom_notice("tls_intercept", Some("my-api"), true, &[], "authorization"),
+            "tls_intercept: dropped header 'authorization' that carried the proxy session \
+             token; route 'my-api' injects the credential outside request headers"
+        );
+    }
+
+    #[test]
+    fn unlisted_phantom_is_consumed_only_when_it_carries_the_session_token() {
+        let token = Zeroizing::new("session-token-value".to_string());
+        let injected = vec!["x-api-key".to_string()];
+        for value in [
+            "session-token-value",
+            "Bearer session-token-value",
+            "bEaReR session-token-value",
+        ] {
+            assert!(
+                consume_unlisted_phantom(
+                    "reverse",
+                    Some("consume-route"),
+                    true,
+                    &injected,
+                    "Authorization",
+                    value,
+                    &token,
+                ),
+                "expected {value:?} to be consumed"
+            );
+        }
+        for value in ["Bearer other-session-token", "Bearer something-else", ""] {
+            assert!(
+                !consume_unlisted_phantom(
+                    "reverse",
+                    Some("consume-route"),
+                    true,
+                    &injected,
+                    "Authorization",
+                    value,
+                    &token,
+                ),
+                "expected {value:?} to be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_phantom_warning_is_once_per_route_and_header() {
+        assert!(claim_phantom_warning(
+            "reverse",
+            Some("dedupe-route"),
+            "x-unlisted"
+        ));
+        assert!(!claim_phantom_warning(
+            "reverse",
+            Some("dedupe-route"),
+            "X-Unlisted"
+        ));
+        assert!(claim_phantom_warning(
+            "reverse",
+            Some("dedupe-route"),
+            "authorization"
+        ));
+        assert!(claim_phantom_warning(
+            "reverse",
+            Some("other-dedupe-route"),
+            "x-unlisted"
+        ));
+        // The same header dropped on the other path gets its own line.
+        assert!(claim_phantom_warning(
+            "tls_intercept",
+            Some("dedupe-route"),
+            "x-unlisted"
+        ));
     }
 
     #[test]
