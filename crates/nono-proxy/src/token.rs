@@ -374,6 +374,30 @@ pub fn validate_proxy_auth(header_bytes: &[u8], session_token: &Zeroizing<String
     Err(ProxyError::InvalidToken)
 }
 
+/// Whether `encoded` is `base64("<user>:<session-token>")`, without logging.
+///
+/// Silent counterpart to [`validate_basic_auth`]: a non-match here is the
+/// common case, a provider credential, so it must not log.
+#[must_use]
+pub(crate) fn basic_auth_password_matches(
+    encoded: &str,
+    session_token: &Zeroizing<String>,
+) -> bool {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let Ok(decoded) = STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(decoded_str) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let Some((_, password)) = decoded_str.split_once(':') else {
+        return false;
+    };
+    constant_time_eq(password.as_bytes(), session_token.as_bytes())
+}
+
 /// Validate Basic auth where the password is the session token.
 ///
 /// Expected format: base64("username:token"). The username is ignored;

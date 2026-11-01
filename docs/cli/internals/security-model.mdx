@@ -272,7 +272,7 @@ The kernel enforcement ensures the child cannot bypass the proxy by connecting d
 Every proxy session generates a 256-bit random token (via `getrandom`). The child receives it as `NONO_PROXY_TOKEN`. Every request must include this token:
 
 - CONNECT mode: `Proxy-Authorization: Bearer <token>`
-- Reverse proxy mode: `X-Nono-Token: <token>`
+- Reverse proxy mode: the route's configured phantom lane (header, path, or query parameter), the password lane of `Authorization: Basic <token>`, or `Proxy-Authorization: <token>`
 
 Tokens are compared using constant-time equality to prevent timing attacks. This prevents other localhost processes from using the proxy even if they discover the port number.
 

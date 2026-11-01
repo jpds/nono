@@ -4087,6 +4087,36 @@ mod tests {
         format!("127.0.0.1:{}", addr.port())
     }
 
+    /// Mock origin that records each request head verbatim and replies `200 ok`.
+    async fn spawn_capture_upstream() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heads_handle = std::sync::Arc::clone(&heads);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let heads_handle = std::sync::Arc::clone(&heads_handle);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    heads_handle
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), heads)
+    }
+
     /// A mock upstream (enterprise) proxy: answers any CONNECT with
     /// `200 Connection Established`, then echoes tunnelled bytes back so a
     /// chained CONNECT can be verified end-to-end.
@@ -4384,6 +4414,102 @@ mod tests {
         assert!(
             status.contains("407"),
             "with auth required an unauthenticated reverse request must be challenged, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    /// Read a proxy response to EOF, failing if the exchange never ends.
+    async fn read_to_close(client: &mut tokio::net::TcpStream) -> String {
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("proxy must close the connection after one exchange")
+        .unwrap();
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    #[tokio::test]
+    async fn reverse_route_accepts_basic_authorization_phantom() {
+        // A route's phantom can arrive as `Authorization: Basic
+        // base64(<user>:<token>)` with no `Proxy-Authorization`. Accepting it is
+        // the same token boundary; the header must never reach the upstream.
+        let (upstream, heads) = spawn_capture_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("nono:{}", handle.token.as_str()))
+        };
+        let request = format!(
+            "GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {creds}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let response = read_to_close(&mut client).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "a Basic phantom must authenticate the route, got: {response:?}"
+        );
+
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "upstream should see exactly one request");
+        assert!(
+            !heads[0].to_ascii_lowercase().contains("authorization"),
+            "the session token must never reach the upstream, got: {:?}",
+            heads[0]
+        );
+        assert!(
+            !heads[0].contains(handle.token.as_str()),
+            "the session token value must never reach the upstream, got: {:?}",
+            heads[0]
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reverse_route_rejects_wrong_basic_authorization_phantom() {
+        // Only the password lane authenticates: a wrong password is not a
+        // phantom, and nothing may be forwarded upstream.
+        let (upstream, heads) = spawn_capture_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode("nono:wrong")
+        };
+        let request = format!(
+            "GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {creds}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let response = read_to_close(&mut client).await;
+
+        assert!(
+            response.contains("407"),
+            "a wrong Basic password must be challenged, got: {response:?}"
+        );
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "a rejected request must not reach the upstream"
         );
         handle.shutdown();
     }

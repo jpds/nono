@@ -346,13 +346,17 @@ pub async fn handle_reverse_proxy(
     // `require_auth` is disabled (standalone `nono proxy --no-auth`).
     if ctx.require_auth {
         if let Some(cred) = cred {
-            if let Err(e) = validate_phantom_token_for_mode_multi(
-                &cred.proxy_inject_mode,
+            if let Err(e) = or_basic_phantom(
+                validate_phantom_token_for_mode_multi(
+                    &cred.proxy_inject_mode,
+                    remaining_header,
+                    &upstream_path,
+                    &cred.proxy_header_names,
+                    cred.proxy_path_pattern.as_deref(),
+                    cred.proxy_query_param_name.as_deref(),
+                    &route.expected_phantom(ctx.session_token),
+                ),
                 remaining_header,
-                &upstream_path,
-                &cred.proxy_header_names,
-                cred.proxy_path_pattern.as_deref(),
-                cred.proxy_query_param_name.as_deref(),
                 &route.expected_phantom(ctx.session_token),
             ) {
                 let deny_ctx = audit::EventContext {
@@ -374,13 +378,17 @@ pub async fn handle_reverse_proxy(
                 return Ok(());
             }
         } else if let Some(cmd) = cmd_route {
-            if let Err(e) = validate_phantom_token_for_mode_multi(
-                &cmd.proxy_inject_mode,
+            if let Err(e) = or_basic_phantom(
+                validate_phantom_token_for_mode_multi(
+                    &cmd.proxy_inject_mode,
+                    remaining_header,
+                    &upstream_path,
+                    &cmd.proxy_header_names,
+                    cmd.proxy_path_pattern.as_deref(),
+                    cmd.proxy_query_param_name.as_deref(),
+                    &route.expected_phantom(ctx.session_token),
+                ),
                 remaining_header,
-                &upstream_path,
-                &cmd.proxy_header_names,
-                cmd.proxy_path_pattern.as_deref(),
-                cmd.proxy_query_param_name.as_deref(),
                 &route.expected_phantom(ctx.session_token),
             ) {
                 let deny_ctx = audit::EventContext {
@@ -401,7 +409,11 @@ pub async fn handle_reverse_proxy(
                 send_error(stream, 401, "Unauthorized").await?;
                 return Ok(());
             }
-        } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
+        } else if let Err(e) = or_basic_phantom(
+            token::validate_proxy_auth(remaining_header, ctx.session_token),
+            remaining_header,
+            ctx.session_token,
+        ) {
             let deny_ctx = audit::EventContext {
                 auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
@@ -626,6 +638,15 @@ pub async fn handle_reverse_proxy(
         ) {
             continue;
         }
+        // A phantom the route does not inject cannot authenticate, and
+        // forwarding it would hand the provider the session token.
+        if value_presents_phantom_token(value, ctx.session_token) {
+            debug!(
+                "reverse: dropped header '{}' that carried the proxy session token",
+                name
+            );
+            continue;
+        }
         req_builder = req_builder.header(name.as_str(), value.as_str());
     }
 
@@ -675,13 +696,55 @@ pub async fn handle_reverse_proxy(
     Ok(())
 }
 
+/// Whether `value` carries the session token as the password of
+/// `Basic base64(<user>:<token>)`.
+fn value_is_basic_phantom(value: &str, session_token: &Zeroizing<String>) -> bool {
+    const BASIC_PREFIX: &str = "basic ";
+    let value = value.trim();
+    value
+        .get(..BASIC_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BASIC_PREFIX))
+        && token::basic_auth_password_matches(value[BASIC_PREFIX.len()..].trim(), session_token)
+}
+
+/// Whether the request presents the session token in the password lane of
+/// `Authorization: Basic base64(<user>:<token>)`.
+///
+/// Clients that build credentials from a URL userinfo pair send only this
+/// lane, with no `Proxy-Authorization` and no `Bearer` prefix. Fallback only:
+/// the failed lane check already logged its diagnostic.
+fn presents_basic_phantom_auth(header_bytes: &[u8], session_token: &Zeroizing<String>) -> bool {
+    std::str::from_utf8(header_bytes).is_ok_and(|header_str| {
+        header_str.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("Authorization")
+                    && value_is_basic_phantom(value, session_token)
+            })
+        })
+    })
+}
+
+/// Accept a request whose only valid lane is the Basic password; keep the
+/// lane's error otherwise.
+fn or_basic_phantom(
+    result: Result<()>,
+    header_bytes: &[u8],
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
+    if result.is_ok() || presents_basic_phantom_auth(header_bytes, session_token) {
+        Ok(())
+    } else {
+        result
+    }
+}
+
 /// Handle a reverse-proxy request for a SPIFFE-authenticated route.
 ///
 /// Validate the localhost auth boundary for SPIFFE reverse-proxy requests.
 ///
-/// Accepts `Proxy-Authorization` (forward-proxy style via `HTTP_PROXY`), or the
-/// session token in `Authorization` (SDK / `*_BASE_URL` style) or bare
-/// `x-api-key` (clients such as the Claude CLI send the key without a prefix).
+/// Accepts `Proxy-Authorization` (forward-proxy style via `HTTP_PROXY`),
+/// `Authorization: Bearer <session-token>` (SDK / `*_BASE_URL` style), a bare
+/// `x-api-key`, or the password lane of `Authorization: Basic`.
 fn validate_reverse_local_auth(
     remaining_header: &[u8],
     upstream_path: &str,
@@ -690,13 +753,17 @@ fn validate_reverse_local_auth(
     if token::validate_proxy_auth(remaining_header, session_token).is_ok() {
         return Ok(());
     }
-    validate_phantom_token_for_mode_multi(
-        &crate::config::InjectMode::Header,
+    or_basic_phantom(
+        validate_phantom_token_for_mode_multi(
+            &crate::config::InjectMode::Header,
+            remaining_header,
+            upstream_path,
+            &["Authorization", "x-api-key"],
+            None,
+            None,
+            session_token,
+        ),
         remaining_header,
-        upstream_path,
-        &["Authorization", "x-api-key"],
-        None,
-        None,
         session_token,
     )
 }
@@ -1974,16 +2041,6 @@ fn phantom_token_value(value: &str) -> &str {
     }
 }
 
-/// Whether `value` presents the proxy session token, with or without a
-/// `Bearer ` prefix.
-#[must_use]
-pub(crate) fn value_presents_phantom_token(value: &str, session_token: &Zeroizing<String>) -> bool {
-    token::constant_time_eq(
-        phantom_token_value(value.trim()).as_bytes(),
-        session_token.as_bytes(),
-    )
-}
-
 /// Header names whose value presents `session_token`, in wire order. Names
 /// only: the token is never returned or logged.
 fn phantom_presenting_headers(
@@ -2229,6 +2286,22 @@ fn validate_phantom_token_basic_any<S: AsRef<str>>(
         );
     }
     Err(ProxyError::InvalidToken)
+}
+
+/// Whether `value` presents the proxy session token: bare, with a `Bearer `
+/// prefix, or as the password lane of `Basic base64(<user>:<token>)`.
+#[must_use]
+pub(crate) fn value_presents_phantom_token(value: &str, session_token: &Zeroizing<String>) -> bool {
+    const BEARER_PREFIX: &str = "bearer ";
+    let value = value.trim();
+    if value_is_basic_phantom(value, session_token) {
+        return true;
+    }
+    let token_value = value
+        .get(..BEARER_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(BEARER_PREFIX))
+        .map_or(value, |_| value[BEARER_PREFIX.len()..].trim());
+    token::constant_time_eq(token_value.as_bytes(), session_token.as_bytes())
 }
 
 /// Filter headers, removing hop-by-hop and proxy-internal headers.
@@ -3527,6 +3600,61 @@ mod tests {
         let encoded = STANDARD.encode("nocolon");
         let header = format!("Authorization: Basic {encoded}\r\n\r\n");
         assert!(validate_phantom_token_basic(header.as_bytes(), "Authorization", &token).is_err());
+    }
+
+    #[test]
+    fn test_presents_basic_phantom_auth_accepts_any_username() {
+        // The username is client-chosen; only the password carries the token.
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        for user in ["nono", "clickhouse", ""] {
+            let encoded = STANDARD.encode(format!("{user}:secret123"));
+            let header = format!("Authorization: Basic {encoded}\r\n\r\n");
+            assert!(
+                presents_basic_phantom_auth(header.as_bytes(), &token),
+                "user {user:?} must authenticate with the token as password"
+            );
+        }
+    }
+
+    #[test]
+    fn test_presents_basic_phantom_auth_rejects_wrong_password() {
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        let encoded = STANDARD.encode("nono:wrong");
+        let header = format!("Authorization: Basic {encoded}\r\n\r\n");
+        assert!(!presents_basic_phantom_auth(header.as_bytes(), &token));
+    }
+
+    #[test]
+    fn test_presents_basic_phantom_auth_ignores_other_headers() {
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        let encoded = STANDARD.encode("nono:secret123");
+        let header = format!("x-api-key: {encoded}\r\n\r\n");
+        assert!(!presents_basic_phantom_auth(header.as_bytes(), &token));
+    }
+
+    #[test]
+    fn test_value_presents_phantom_token_recognises_basic_lane() {
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        let encoded = STANDARD.encode("nono:secret123");
+        assert!(value_presents_phantom_token(
+            &format!("Basic {encoded}"),
+            &token
+        ));
+        assert!(value_presents_phantom_token(
+            &format!("basic {encoded}"),
+            &token
+        ));
+        assert!(value_presents_phantom_token("Bearer secret123", &token));
+        assert!(value_presents_phantom_token("secret123", &token));
+        assert!(!value_presents_phantom_token(
+            &format!("Basic {}", STANDARD.encode("nono:wrong")),
+            &token
+        ));
+        assert!(!value_presents_phantom_token("Basic !!!", &token));
     }
 
     #[test]

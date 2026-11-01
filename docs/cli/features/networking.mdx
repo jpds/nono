@@ -32,7 +32,7 @@ The proxy supports three modes that can be combined in a single session:
 
 When domain filtering, credential injection, or a network approval backend is active, the proxy starts automatically for `nono run` and `nono shell`. `HTTP_PROXY` and `HTTPS_PROXY` are set in the child environment. For Node.js 26+, nono also sets `NODE_USE_ENV_PROXY=1` so built-in `fetch()` reads `HTTPS_PROXY`.
 
-A 256-bit session token is generated for each proxy session. The child must include it in every request (`Proxy-Authorization` header for CONNECT, `X-Nono-Token` for reverse proxy), preventing other localhost processes from using the proxy.
+A 256-bit session token is generated for each proxy session. The child must include it in every request (`Proxy-Authorization` header for CONNECT; the route's configured phantom header, `Authorization: Basic`, or `Proxy-Authorization` for reverse proxy), preventing other localhost processes from using the proxy.
 
 ## Blocking All Network
 
